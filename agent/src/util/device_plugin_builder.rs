@@ -88,7 +88,6 @@ impl DevicePluginBuilderInterface for DevicePluginBuilder {
         let device_plugin_service = DevicePluginService {
             instance_name: instance_name.clone(),
             instance_id: instance_id.clone(),
-            endpoint: device_endpoint.clone(),
             config: config.spec.clone(),
             config_name: config.metadata.name.clone().unwrap(),
             config_uid: config.metadata.uid.as_ref().unwrap().clone(),
