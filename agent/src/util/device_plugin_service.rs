@@ -59,7 +59,22 @@ pub struct InstanceInfo {
     pub connectivity_status: InstanceConnectivityStatus,
 }
 
-pub type InstanceMap = Arc<RwLock<HashMap<String, InstanceInfo>>>;
+#[derive(Clone, Debug)]
+pub struct InstanceConfig {
+    pub usage_update_message_sender: Option<broadcast::Sender<ListAndWatchMessageKind>>,
+    pub instances: HashMap<String, InstanceInfo>,
+}
+
+impl InstanceConfig {
+    pub fn new() -> Self {
+        InstanceConfig {
+            usage_update_message_sender: None,
+            instances: HashMap::new(),
+        }
+    }
+}
+
+pub type InstanceMap = Arc<RwLock<InstanceConfig>>;
 
 /// Kubernetes Device-Plugin for an Instance.
 ///
@@ -220,7 +235,11 @@ impl DevicePluginService {
                         );
                         // This means kubelet is down/has been restarted. Remove instance from instance map so
                         // do_periodic_discovery will create a new device plugin service for this instance.
-                        dps.instance_map.write().await.remove(&dps.instance_name);
+                        dps.instance_map
+                            .write()
+                            .await
+                            .instances
+                            .remove(&dps.instance_name);
                         dps.server_ender_sender.clone().send(()).await.unwrap();
                         keep_looping = false;
                     }
@@ -598,7 +617,7 @@ async fn try_create_instance(
     }
 
     // Successfully created or updated instance. Add it to instance_map.
-    dps.instance_map.write().await.insert(
+    dps.instance_map.write().await.instances.insert(
         dps.instance_name.clone(),
         InstanceInfo {
             list_and_watch_message_sender: dps.list_and_watch_message_sender.clone(),
@@ -625,6 +644,7 @@ async fn build_list_and_watch_response(
         .instance_map
         .read()
         .await
+        .instances
         .contains_key(&dps.instance_name)
     {
         trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", dps.instance_name);
@@ -638,6 +658,7 @@ async fn build_list_and_watch_response(
         .instance_map
         .read()
         .await
+        .instances
         .get(&dps.instance_name)
         .unwrap()
         .connectivity_status
@@ -740,6 +761,7 @@ pub async fn terminate_device_plugin_service(
         instance_name
     );
     instance_map
+        .instances
         .get(instance_name)
         .unwrap()
         .list_and_watch_message_sender
@@ -750,7 +772,7 @@ pub async fn terminate_device_plugin_service(
         "terminate_device_plugin_service -- removing Instance {} from instance_map",
         instance_name
     );
-    instance_map.remove(instance_name);
+    instance_map.instances.remove(instance_name);
     Ok(())
 }
 
@@ -841,15 +863,18 @@ mod device_plugin_service_tests {
             broadcast::channel(4);
         let (server_ender_sender, _) = mpsc::channel(1);
 
-        let mut map = HashMap::new();
+        let mut instances = HashMap::new();
         if add_to_instance_map {
             let instance_info: InstanceInfo = InstanceInfo {
                 list_and_watch_message_sender: list_and_watch_message_sender.clone(),
                 connectivity_status,
             };
-            map.insert(device_instance_name.clone(), instance_info);
+            instances.insert(device_instance_name.clone(), instance_info);
         }
-        let instance_map: InstanceMap = Arc::new(RwLock::new(map));
+        let instance_map: InstanceMap = Arc::new(RwLock::new(InstanceConfig {
+            usage_update_message_sender: None,
+            instances,
+        }));
         let mut properties = HashMap::new();
         properties.insert("DEVICE_LOCATION_INFO".to_string(), "endpoint".to_string());
         let device = Device {
@@ -1000,6 +1025,7 @@ mod device_plugin_service_tests {
             .instance_map
             .read()
             .await
+            .instances
             .contains_key(&dps.instance_name));
     }
 
@@ -1042,6 +1068,7 @@ mod device_plugin_service_tests {
             .instance_map
             .read()
             .await
+            .instances
             .contains_key(&dps.instance_name));
     }
 
@@ -1074,6 +1101,7 @@ mod device_plugin_service_tests {
             .instance_map
             .read()
             .await
+            .instances
             .contains_key(&dps.instance_name));
     }
 
@@ -1145,6 +1173,7 @@ mod device_plugin_service_tests {
             .instance_map
             .read()
             .await
+            .instances
             .contains_key(&dps.instance_name));
     }
 
