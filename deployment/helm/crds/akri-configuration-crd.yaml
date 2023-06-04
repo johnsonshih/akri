@@ -24,6 +24,9 @@ spec:
                       type: string
                 capacity:
                   type: integer
+                configurationResourceFrom:
+                  type: string
+                  enum: ["instance", "deviceUsage"]
                 brokerSpec: # {{BrokerSpec}}
                   type: object
                   properties: 
