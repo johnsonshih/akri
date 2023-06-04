@@ -23,7 +23,11 @@ use log::{error, info, trace};
 use mock_instant::Instant;
 #[cfg(not(test))]
 use std::time::Instant;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time::timeout,
@@ -57,6 +61,15 @@ pub struct InstanceInfo {
     pub list_and_watch_message_sender: broadcast::Sender<ListAndWatchMessageKind>,
     /// Instance's `InstanceConnectivityStatus`
     pub connectivity_status: InstanceConnectivityStatus,
+    /// Instance's hash id
+    pub instance_id: String,
+    /// Device that the instance represents.
+    /// Contains information about environment variables and volumes that should be mounted
+    /// into requesting Pods.
+    pub device: Device,
+    /// Device usage slots allocated by Configuration Device Plugin
+    /// Used to check if a device usage slot is allocated by Configuration or Instance Device Plugin
+    pub configuration_usage_slots: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +635,9 @@ async fn try_create_instance(
         InstanceInfo {
             list_and_watch_message_sender: dps.list_and_watch_message_sender.clone(),
             connectivity_status: InstanceConnectivityStatus::Online,
+            instance_id: dps.instance_id.clone(),
+            device: dps.device.clone(),
+            configuration_usage_slots: HashSet::new(),
         },
     );
 
@@ -863,18 +879,6 @@ mod device_plugin_service_tests {
             broadcast::channel(4);
         let (server_ender_sender, _) = mpsc::channel(1);
 
-        let mut instances = HashMap::new();
-        if add_to_instance_map {
-            let instance_info: InstanceInfo = InstanceInfo {
-                list_and_watch_message_sender: list_and_watch_message_sender.clone(),
-                connectivity_status,
-            };
-            instances.insert(device_instance_name.clone(), instance_info);
-        }
-        let instance_map: InstanceMap = Arc::new(RwLock::new(InstanceConfig {
-            usage_update_message_sender: None,
-            instances,
-        }));
         let mut properties = HashMap::new();
         properties.insert("DEVICE_LOCATION_INFO".to_string(), "endpoint".to_string());
         let device = Device {
@@ -883,6 +887,21 @@ mod device_plugin_service_tests {
             mounts: Vec::new(),
             device_specs: Vec::new(),
         };
+        let mut instances = HashMap::new();
+        if add_to_instance_map {
+            let instance_info: InstanceInfo = InstanceInfo {
+                list_and_watch_message_sender: list_and_watch_message_sender.clone(),
+                connectivity_status,
+                instance_id: instance_id.to_string(),
+                device: device.clone(),
+                configuration_usage_slots: HashSet::new(),
+            };
+            instances.insert(device_instance_name.clone(), instance_info);
+        }
+        let instance_map: InstanceMap = Arc::new(RwLock::new(InstanceConfig {
+            usage_update_message_sender: None,
+            instances,
+        }));
         let dps = DevicePluginService {
             instance_name: device_instance_name,
             instance_id: instance_id.to_string(),
