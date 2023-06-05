@@ -3,7 +3,7 @@ use super::{
         DEVICE_PLUGIN_PATH, DEVICE_PLUGIN_SERVER_ENDER_CHANNEL_CAPACITY, K8S_DEVICE_PLUGIN_VERSION,
         KUBELET_SOCKET, LIST_AND_WATCH_MESSAGE_CHANNEL_CAPACITY,
     },
-    device_plugin_service::{DevicePluginService, InstanceMap},
+    device_plugin_service::{DevicePluginService, InstanceDevicePlugin, InstanceMap},
     v1beta1,
     v1beta1::{
         device_plugin_server::{DevicePlugin, DevicePluginServer},
@@ -20,7 +20,7 @@ use futures::TryFutureExt;
 use log::{info, trace};
 #[cfg(test)]
 use mockall::{automock, predicate::*};
-use std::{convert::TryFrom, env, path::Path, time::SystemTime};
+use std::{convert::TryFrom, env, path::Path, sync::Arc, time::SystemTime};
 use tokio::{
     net::UnixListener,
     net::UnixStream,
@@ -72,19 +72,22 @@ impl DevicePluginBuilderInterface for DevicePluginBuilder {
             broadcast::channel(LIST_AND_WATCH_MESSAGE_CHANNEL_CAPACITY);
         let (server_ender_sender, server_ender_receiver) =
             mpsc::channel(DEVICE_PLUGIN_SERVER_ENDER_CHANNEL_CAPACITY);
+        let device_plugin_behavior = Arc::new(InstanceDevicePlugin {
+            instance_id: instance_id.clone(),
+            shared,
+            device: device.clone(),
+        });
         let device_plugin_service = DevicePluginService {
             instance_name: instance_name.clone(),
-            instance_id: instance_id.clone(),
             config: config.spec.clone(),
             config_name: config.metadata.name.clone().unwrap(),
             config_uid: config.metadata.uid.as_ref().unwrap().clone(),
             config_namespace: config.metadata.namespace.as_ref().unwrap().clone(),
-            shared,
             node_name: env::var("AGENT_NODE_NAME")?,
             instance_map,
             list_and_watch_message_sender,
             server_ender_sender: server_ender_sender.clone(),
-            device,
+            device_plugin_behavior,
         };
 
         self.serve(
