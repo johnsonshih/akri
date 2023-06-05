@@ -388,6 +388,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
             );
             let mut akri_annotations = HashMap::new();
             let mut akri_device_properties = HashMap::new();
+            let mut akri_devices = HashMap::<String, Device>::new();
             for device_usage_id in request.devices_i_ds {
                 trace!(
                     "InstanceDevicePlugin::allocate - for Instance {} processing request for device usage slot id {}",
@@ -413,6 +414,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                     })
                     .collect::<HashMap<String, String>>();
                 akri_device_properties.extend(converted_properties);
+                akri_devices.insert(dps.instance_name.clone(), self.device.clone());
 
                 if let Err(e) = try_update_instance_device_usage(
                     &device_usage_id,
@@ -442,7 +444,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
             let response = build_container_allocate_response(
                 broker_properties,
                 akri_annotations,
-                &self.device,
+                &akri_devices.into_values().collect(),
             );
             container_responses.push(response);
         }
@@ -558,35 +560,41 @@ async fn try_update_instance_device_usage(
 fn build_container_allocate_response(
     broker_properties: HashMap<String, String>,
     annotations: HashMap<String, String>,
-    device: &Device,
+    devices: &Vec<Device>,
 ) -> v1beta1::ContainerAllocateResponse {
-    // Cast v0 discovery Mount and DeviceSpec types to v1beta1 DevicePlugin types
-    let mounts: Vec<Mount> = device
-        .mounts
-        .clone()
-        .into_iter()
-        .map(|mount| Mount {
-            container_path: mount.container_path,
-            host_path: mount.host_path,
-            read_only: mount.read_only,
-        })
-        .collect();
-    let device_specs: Vec<DeviceSpec> = device
-        .device_specs
-        .clone()
-        .into_iter()
-        .map(|device_spec| DeviceSpec {
-            container_path: device_spec.container_path,
-            host_path: device_spec.host_path,
-            permissions: device_spec.permissions,
-        })
-        .collect();
+    let mut total_mounts = Vec::new();
+    let mut total_device_specs = Vec::new();
+    for device in devices {
+        // Cast v0 discovery Mount and DeviceSpec types to v1beta1 DevicePlugin types
+        let mounts: Vec<Mount> = device
+            .mounts
+            .clone()
+            .into_iter()
+            .map(|mount| Mount {
+                container_path: mount.container_path,
+                host_path: mount.host_path,
+                read_only: mount.read_only,
+            })
+            .collect();
+        total_mounts.extend(mounts);
 
+        let device_specs: Vec<DeviceSpec> = device
+            .device_specs
+            .clone()
+            .into_iter()
+            .map(|device_spec| DeviceSpec {
+                container_path: device_spec.container_path,
+                host_path: device_spec.host_path,
+                permissions: device_spec.permissions,
+            })
+            .collect();
+        total_device_specs.extend(device_specs);
+    }
     // Create response, setting environment variables to be an instance's properties.
     v1beta1::ContainerAllocateResponse {
         annotations,
-        mounts,
-        devices: device_specs,
+        mounts: total_mounts,
+        devices: total_device_specs,
         envs: broker_properties,
     }
 }
