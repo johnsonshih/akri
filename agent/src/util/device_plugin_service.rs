@@ -396,6 +396,48 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                     device_usage_id
                 );
 
+                // only allow duplicate reserve if the slot is not reserved by Configuration
+                let allow_dup_reserve = match dps
+                    .instance_map
+                    .read()
+                    .await
+                    .instances
+                    .get(&dps.instance_name)
+                    .ok_or_else(|| {
+                        Status::new(
+                            Code::Unknown,
+                            format!("instance {} not found in instance map", dps.instance_name),
+                        )
+                    }) {
+                    Ok(instance_info) => instance_info
+                        .configuration_usage_slots
+                        .contains(&device_usage_id),
+
+                    Err(e) => {
+                        dps.list_and_watch_message_sender
+                            .send(ListAndWatchMessageKind::Continue)
+                            .unwrap();
+                        return Err(e);
+                    }
+                };
+
+                if let Err(e) = try_update_instance_device_usage(
+                    &device_usage_id,
+                    &dps.node_name,
+                    &dps.instance_name,
+                    &dps.config_namespace,
+                    allow_dup_reserve,
+                    kube_interface.clone(),
+                )
+                .await
+                {
+                    trace!("InstanceDevicePlugin::allocate - could not assign {} slot to {} node ... forcing list_and_watch to continue", device_usage_id, &dps.node_name);
+                    dps.list_and_watch_message_sender
+                        .send(ListAndWatchMessageKind::Continue)
+                        .unwrap();
+                    return Err(e);
+                }
+
                 akri_annotations.insert(
                     format!("{}{}", AKRI_SLOT_ANNOTATION_NAME_PREFIX, &device_usage_id),
                     device_usage_id.clone(),
@@ -416,22 +458,6 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                 akri_device_properties.extend(converted_properties);
                 akri_devices.insert(dps.instance_name.clone(), self.device.clone());
 
-                if let Err(e) = try_update_instance_device_usage(
-                    &device_usage_id,
-                    &dps.node_name,
-                    &dps.instance_name,
-                    &dps.config_namespace,
-                    kube_interface.clone(),
-                )
-                .await
-                {
-                    trace!("InstanceDevicePlugin::allocate - could not assign {} slot to {} node ... forcing list_and_watch to continue", device_usage_id, &dps.node_name);
-                    dps.list_and_watch_message_sender
-                        .send(ListAndWatchMessageKind::Continue)
-                        .unwrap();
-                    return Err(e);
-                }
-
                 trace!(
                     "InstanceDevicePlugin::allocate - finished processing device_usage_id {}",
                     device_usage_id
@@ -447,6 +473,16 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                 &akri_devices.into_values().collect(),
             );
             container_responses.push(response);
+        }
+
+        // Notify device usage had been changed
+        if let Some(sender) = &dps.instance_map.read().await.usage_update_message_sender {
+            if let Err(e) = sender.send(ListAndWatchMessageKind::Continue) {
+                error!(
+                    "InstanceDevicePlugin::allocate - fails to notify device usage, error {}",
+                    e
+                );
+            }
         }
         trace!(
             "InstanceDevicePlugin::allocate - for Instance {} returning responses",
@@ -508,6 +544,7 @@ async fn try_update_instance_device_usage(
     node_name: &str,
     instance_name: &str,
     instance_namespace: &str,
+    allow_duplicate_reserve: bool,
     kube_interface: Arc<impl KubeInterface + ?Sized>,
 ) -> Result<(), Status> {
     let mut instance: InstanceSpec;
@@ -550,7 +587,14 @@ async fn try_update_instance_device_usage(
             }
         } else {
             // Instance slot already reserved for this node
-            return Ok(());
+            info!(
+                "device usage id {} already reserved on node {}",
+                device_usage_id, node_name
+            );
+            if allow_duplicate_reserve {
+                return Ok(());
+            }
+            return Err(Status::new(Code::Unknown, "slot already reserved"));
         }
     }
     Ok(())
