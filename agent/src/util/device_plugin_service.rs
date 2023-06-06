@@ -1517,6 +1517,7 @@ mod device_plugin_service_tests {
     }
 
     enum DevicePluginKind {
+        Configuration,
         Instance,
     }
 
@@ -1626,10 +1627,11 @@ mod device_plugin_service_tests {
             instances.insert(device_instance_name.clone(), instance_info);
         }
         let instance_map: InstanceMap = Arc::new(RwLock::new(InstanceConfig {
-            usage_update_message_sender: Some(configuration_list_and_watch_message_sender),
+            usage_update_message_sender: Some(configuration_list_and_watch_message_sender.clone()),
             instances,
         }));
         let list_and_watch_message_sender = match device_plugin_kind {
+            DevicePluginKind::Configuration => configuration_list_and_watch_message_sender,
             DevicePluginKind::Instance => instance_list_and_watch_message_sender,
         };
         let dps = DevicePluginService {
@@ -2409,5 +2411,41 @@ mod device_plugin_service_tests {
             .configuration_list_and_watch_message_receiver
             .try_recv()
             .is_err());
+    }
+
+    fn create_configuration_device_plugin_service(
+        connectivity_status: InstanceConnectivityStatus,
+        add_to_instance_map: bool,
+        configuration_resource_from: ConfigurationResourceFrom,
+    ) -> (
+        DevicePluginService,
+        Arc<ConfigurationDevicePlugin>,
+        DevicePluginServiceReceivers,
+    ) {
+        let path_to_config = "../test/yaml/config-a.yaml";
+        let instance_id = "b494b6";
+        let device = Device {
+            id: "n/a".to_string(),
+            properties: HashMap::from([(
+                "DEVICE_LOCATION_INFO".to_string(),
+                "endpoint".to_string(),
+            )]),
+            mounts: Vec::new(),
+            device_specs: Vec::new(),
+        };
+
+        let (mut dps, receivers) = create_device_plugin_service_common(
+            DevicePluginKind::Configuration,
+            path_to_config,
+            instance_id,
+            &device,
+            connectivity_status,
+            add_to_instance_map,
+        );
+        let device_plugin_behavior = Arc::new(ConfigurationDevicePlugin {});
+        dps.device_plugin_behavior = device_plugin_behavior.clone();
+        dps.config.configuration_resource_from = configuration_resource_from;
+
+        (dps, device_plugin_behavior, receivers)
     }
 }
