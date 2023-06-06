@@ -1471,6 +1471,11 @@ pub async fn terminate_device_plugin_service(
     Ok(())
 }
 
+/// This creates a Configuration's unique name
+pub fn get_device_configuration_name(config_name: &str) -> String {
+    config_name.to_string().replace(['.', '/'], "-")
+}
+
 /// This creates an Instance's unique name
 pub fn get_device_instance_name(id: &str, config_name: &str) -> String {
     format!("{}-{}", config_name, &id)

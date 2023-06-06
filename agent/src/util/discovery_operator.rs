@@ -466,6 +466,8 @@ impl DiscoveryOperator {
 pub mod start_discovery {
     use super::super::registration::{DiscoveryDetails, DiscoveryHandlerEndpoint};
     // Use this `mockall` macro to automate importing a mock type in test mode, or a real type otherwise.
+    use super::super::device_plugin_builder::{DevicePluginBuilder, DevicePluginBuilderInterface};
+    use super::device_plugin_service::get_device_configuration_name;
     #[double]
     pub use super::DiscoveryOperator;
     use super::StreamType;
@@ -489,6 +491,25 @@ pub mod start_discovery {
         finished_all_discovery_sender: &mut mpsc::Sender<()>,
         kube_interface: Arc<dyn k8s::KubeInterface>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        internal_start_discovery(
+            discovery_operator,
+            new_discovery_handler_sender,
+            stop_all_discovery_sender,
+            finished_all_discovery_sender,
+            kube_interface,
+            Box::new(DevicePluginBuilder {}),
+        )
+        .await
+    }
+
+    pub async fn internal_start_discovery(
+        discovery_operator: DiscoveryOperator,
+        new_discovery_handler_sender: broadcast::Sender<String>,
+        stop_all_discovery_sender: broadcast::Sender<()>,
+        finished_all_discovery_sender: &mut mpsc::Sender<()>,
+        kube_interface: Arc<dyn k8s::KubeInterface>,
+        device_plugin_builder: Box<dyn DevicePluginBuilderInterface>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         let config = discovery_operator.get_config();
         info!(
             "start_discovery - entered for {} discovery handler",
@@ -496,7 +517,29 @@ pub mod start_discovery {
         );
         let config_name = config.metadata.name.clone().unwrap();
         let mut tasks = Vec::new();
+        let instance_map = discovery_operator.get_instance_map();
         let discovery_operator = Arc::new(discovery_operator);
+
+        // Create a device plugin for the Configuration
+        let config_dp_name = get_device_configuration_name(&config_name);
+        trace!(
+            "start_discovery - create configuration device plugin {}",
+            config_dp_name
+        );
+        match device_plugin_builder
+            .build_configuration_device_plugin(config_dp_name, &config, instance_map.clone())
+            .await
+        {
+            Ok(s) => {
+                instance_map.write().await.usage_update_message_sender = Some(s);
+            }
+            Err(e) => {
+                error!(
+                    "start_discovery - error {} building configuration device plugin",
+                    e
+                );
+            }
+        };
 
         // Call discover on already registered Discovery Handlers requested by this Configuration's
         let known_dh_discovery_operator = discovery_operator.clone();
@@ -1077,13 +1120,23 @@ pub mod tests {
         let (stop_all_discovery_sender, _) = broadcast::channel(2);
         let thread_stop_all_discovery_sender = stop_all_discovery_sender.clone();
         let mock_kube_interface: Arc<dyn k8s::KubeInterface> = Arc::new(MockKubeInterface::new());
+        let mut mock_device_plugin_builder = Box::new(MockDevicePluginBuilderInterface::new());
+        mock_device_plugin_builder
+            .expect_build_configuration_device_plugin()
+            .times(1)
+            .returning(move |_, _, _| {
+                let (sender, _) = broadcast::channel(2);
+                Ok(sender)
+            });
+
         let start_discovery_handle = tokio::spawn(async move {
-            start_discovery::start_discovery(
+            start_discovery::internal_start_discovery(
                 mock_discovery_operator,
                 new_dh_sender.to_owned(),
                 thread_stop_all_discovery_sender,
                 &mut finished_discovery_sender,
                 mock_kube_interface,
+                mock_device_plugin_builder,
             )
             .await
             .unwrap();

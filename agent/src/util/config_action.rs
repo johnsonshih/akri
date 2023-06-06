@@ -345,7 +345,10 @@ async fn handle_config_delete(
             .clone();
         config_map_locked.remove(&config_id);
     }
-    delete_all_instances_in_map(kube_interface, instance_map, config_id).await?;
+    delete_all_instances_in_map(kube_interface, instance_map.clone(), config_id).await?;
+    if let Some(sender) = &instance_map.read().await.usage_update_message_sender {
+        sender.send(device_plugin_service::ListAndWatchMessageKind::End)?;
+    }
     Ok(())
 }
 
