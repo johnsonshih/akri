@@ -10,7 +10,7 @@ use super::v1beta1::{
 use akri_discovery_utils::discovery::v0::Device;
 use akri_shared::{
     akri::{
-        configuration::ConfigurationSpec,
+        configuration::{ConfigurationResourceFrom, ConfigurationSpec},
         instance::InstanceSpec,
         retry::{random_delay, MAX_INSTANCE_UPDATE_TRIES},
         AKRI_SLOT_ANNOTATION_NAME_PREFIX,
@@ -523,6 +523,497 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
             container_responses,
         }))
     }
+}
+
+#[derive(Clone)]
+pub struct ConfigurationDevicePlugin {}
+
+#[tonic::async_trait]
+impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
+    async fn list_and_watch(
+        &self,
+        dps: Arc<DevicePluginService>,
+        kube_interface_provider: &KubeInterfaceProvider,
+        kubelet_update_sender: mpsc::Sender<Result<ListAndWatchResponse, Status>>,
+        polling_interval_secs: u64,
+    ) {
+        let mut list_and_watch_message_receiver = dps.list_and_watch_message_sender.subscribe();
+        let kube_interface = kube_interface_provider.get_kube_interface();
+        let build_virtual_devices_list = match dps.config.configuration_resource_from {
+            ConfigurationResourceFrom::Instance => build_instance_virtual_devices,
+            ConfigurationResourceFrom::DeviceUsage => build_usage_slot_virtual_devices,
+        };
+        let mut keep_looping = true;
+        let mut prev_virtual_devices = HashMap::new();
+        while keep_looping {
+            trace!(
+                "ConfigurationDevicePlugin::list_and_watch - loop iteration for Instance {}",
+                dps.instance_name
+            );
+            let instance_map_snapshot = dps.instance_map.read().await.clone();
+            let mut discovered_devices = HashMap::new();
+            for (instance_name, _) in instance_map_snapshot.instances {
+                let virtual_devices = build_list_and_watch_response(
+                    dps.clone(),
+                    kube_interface.clone(),
+                    |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
+                        // device is healthy if reserved by Configuration
+                        configuration_usage_slots.contains(device_usage_id)
+                    },
+                )
+                .await
+                .unwrap();
+                discovered_devices.insert(instance_name, virtual_devices);
+            }
+            // construct virtual device info list
+            let current_virtual_devices = build_virtual_devices_list(discovered_devices.clone());
+            // Only send the virtual devices if the list has changed
+            if current_virtual_devices != prev_virtual_devices {
+                // find devices that no longer exist, set health state to UNHEALTHY for all devices that are gone
+                let mut devices_to_report = prev_virtual_devices
+                    .keys()
+                    .filter(|key| !current_virtual_devices.contains_key(&(*key).clone()))
+                    .map(|key| (key.clone(), UNHEALTHY.to_string()))
+                    .collect::<HashMap<String, String>>();
+                devices_to_report.extend(current_virtual_devices.clone());
+
+                prev_virtual_devices = current_virtual_devices;
+
+                let resp = v1beta1::ListAndWatchResponse {
+                    devices: devices_to_report
+                        .iter()
+                        .map(|(id, health)| v1beta1::Device {
+                            id: id.clone(),
+                            health: health.clone(),
+                        })
+                        .collect(),
+                };
+                info!(
+                    "ConfigurationDevicePlugin::list_and_watch - for device plugin {}, response = {:?}",
+                    dps.instance_name, resp
+                );
+                // Send virtual devices list back to kubelet
+                if let Err(e) = kubelet_update_sender.send(Ok(resp)).await {
+                    trace!(
+                            "ConfigurationDevicePlugin::list_and_watch - for device plugin {} kubelet no longer receiving with error {}",
+                            dps.instance_name,
+                            e
+                        );
+                    // This means kubelet is down/has been restarted.
+                    dps.server_ender_sender.clone().send(()).await.unwrap();
+                    keep_looping = false;
+                }
+            }
+
+            // Sleep for polling_interval_secs unless receive message to shutdown the server
+            // or continue (and send another list of devices)
+            match timeout(
+                Duration::from_secs(polling_interval_secs),
+                list_and_watch_message_receiver.recv(),
+            )
+            .await
+            {
+                Ok(message) => {
+                    // If receive message to end list_and_watch, send list of unhealthy devices
+                    // and shutdown the server by sending message on server_ender_sender channel
+                    if message == Ok(ListAndWatchMessageKind::End) {
+                        trace!(
+                            "ConfigurationDevicePlugin::list_and_watch - for device plugin {} received message to end",
+                            dps.instance_name
+                        );
+                        if !prev_virtual_devices.is_empty() {
+                            let resp = v1beta1::ListAndWatchResponse {
+                                devices: prev_virtual_devices.keys()
+                                    .map(|id| v1beta1::Device {
+                                        id: id.clone(),
+                                        health: UNHEALTHY.to_string(),
+                                    })
+                                    .collect(),
+                            };
+                            info!(
+                                "ConfigurationDevicePlugin::list_and_watch - for device plugin {}, end response = {:?}",
+                                dps.instance_name, resp
+                            );
+                            kubelet_update_sender.send(Ok(resp))
+                                .await
+                                .unwrap();
+                        }
+                        dps.server_ender_sender.clone().send(()).await.unwrap();
+                        keep_looping = false;
+                    }
+                },
+                Err(_) => trace!(
+                    "ConfigurationDevicePlugin::list_and_watch - for device plugin {} did not receive a message for {} seconds ... continuing",
+                     dps.instance_name, polling_interval_secs
+                ),
+            }
+        }
+        trace!(
+            "ConfigurationDevicePlugin::list_and_watch - for Instance {} ending",
+            dps.instance_name
+        );
+    }
+
+    /// Called when kubelet is trying to reserve for this node a usage slot (or virtual device) of the Instance.
+    /// Tries to update Instance CRD to reserve the requested slot. If cannot reserve that slot, forces `list_and_watch` to continue
+    /// (sending kubelet the latest list of slots) and returns error, so kubelet will not schedule the pod to this node.
+    async fn allocate(
+        &self,
+        dps: Arc<DevicePluginService>,
+        requests: Request<AllocateRequest>,
+        kube_interface_provider: &KubeInterfaceProvider,
+    ) -> Result<Response<AllocateResponse>, Status> {
+        let kube_interface = kube_interface_provider.get_kube_interface();
+        let mut container_responses: Vec<v1beta1::ContainerAllocateResponse> = Vec::new();
+        let mut allocated_instances: HashMap<String, HashSet<String>> = HashMap::new();
+        for request in requests.into_inner().container_requests {
+            trace!(
+                "ConfigurationDevicePlugin::allocate - for Instance {} handling request {:?}",
+                &dps.instance_name,
+                request,
+            );
+            let mut akri_annotations = HashMap::new();
+            let mut akri_device_properties = HashMap::new();
+            let mut akri_devices = HashMap::<String, Device>::new();
+            for device_id in request.devices_i_ds {
+                trace!(
+                    "ConfigurationDevicePlugin::allocate - for Instance {} processing request for device usage slot id {}",
+                    &dps.instance_name,
+                    device_id
+                );
+                let allocation_info = match dps.config.configuration_resource_from {
+                    ConfigurationResourceFrom::Instance => {
+                        get_instance_allocation_info(
+                            &device_id,
+                            &dps.config_namespace,
+                            dps.config.capacity,
+                            &allocated_instances,
+                            dps.instance_map.clone(),
+                            kube_interface.clone(),
+                        )
+                        .await
+                    }
+                    ConfigurationResourceFrom::DeviceUsage => {
+                        get_usage_slot_allocation_info(
+                            &device_id,
+                            &dps.config_namespace,
+                            dps.config.capacity,
+                            &allocated_instances,
+                            dps.instance_map.clone(),
+                            kube_interface.clone(),
+                        )
+                        .await
+                    }
+                };
+                let (instance_name, device_usage_id) = match allocation_info {
+                    Ok(result) => result,
+                    Err(e) => {
+                        dps.list_and_watch_message_sender
+                            .send(ListAndWatchMessageKind::Continue)
+                            .unwrap();
+                        return Err(e);
+                    }
+                };
+                // find device from instance_map
+                let (device, instance_id, configuration_usage_slots) = match dps
+                    .instance_map
+                    .read()
+                    .await
+                    .instances
+                    .get(&instance_name)
+                    .ok_or_else(|| {
+                        Status::new(
+                            Code::Unknown,
+                            format!("instance {} not found in instance map", instance_name),
+                        )
+                    }) {
+                    Ok(instance_info) => (
+                        instance_info.device.clone(),
+                        instance_info.instance_id.clone(),
+                        instance_info.configuration_usage_slots.clone(),
+                    ),
+                    Err(e) => {
+                        dps.list_and_watch_message_sender
+                            .send(ListAndWatchMessageKind::Continue)
+                            .unwrap();
+                        return Err(e);
+                    }
+                };
+
+                // only allow duplicate reserve if the slot is reserved by Configuration
+                let allow_dup_reserve = configuration_usage_slots.contains(&device_usage_id);
+
+                if let Err(e) = try_update_instance_device_usage(
+                    &device_usage_id,
+                    &dps.node_name,
+                    &dps.instance_name,
+                    &dps.config_namespace,
+                    allow_dup_reserve,
+                    kube_interface.clone(),
+                )
+                .await
+                {
+                    trace!("ConfigurationDevicePlugin::allocate - could not assign {} slot to {} node ... forcing list_and_watch to continue", device_usage_id, &dps.node_name);
+                    dps.list_and_watch_message_sender
+                        .send(ListAndWatchMessageKind::Continue)
+                        .unwrap();
+                    return Err(e);
+                }
+
+                akri_annotations.insert(
+                    format!("{}{}", AKRI_SLOT_ANNOTATION_NAME_PREFIX, &device_usage_id),
+                    device_usage_id.clone(),
+                );
+
+                // add suffix _<instance_id> to each device property
+                let device_property_suffix = instance_id.to_uppercase();
+                let converted_properties = device
+                    .properties
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            format!("{}_{}", key, &device_property_suffix),
+                            value.to_string(),
+                        )
+                    })
+                    .collect::<HashMap<String, String>>();
+                akri_device_properties.extend(converted_properties);
+                akri_devices.insert(instance_name.clone(), device.clone());
+
+                allocated_instances
+                    .entry(instance_name.clone())
+                    .or_insert(HashSet::new())
+                    .insert(device_usage_id.clone());
+
+                trace!(
+                    "ConfigurationDevicePlugin::allocate - finished processing device_usage_id {}",
+                    device_usage_id
+                );
+            }
+            // Successfully reserved device_usage_slot[s] for this node.
+            // Add response to list of responses
+            let broker_properties =
+                get_all_broker_properties(&dps.config.broker_properties, &akri_device_properties);
+            let response = build_container_allocate_response(
+                broker_properties,
+                akri_annotations,
+                &akri_devices.into_values().collect(),
+            );
+            container_responses.push(response);
+        }
+
+        // Notify effected instance device plugin to rescan list and watch and update the cl_usage_slot
+        {
+            let mut instance_map = dps.instance_map.write().await;
+            for (instance_name, device_usage_slots) in allocated_instances {
+                trace!(
+                    "ConfigurationDevicePlugin::allocate - notify Instance {} to refresh list_and_watch",
+                    instance_name,
+                );
+
+                instance_map
+                    .instances
+                    .entry(instance_name)
+                    .and_modify(|instance_info| {
+                        instance_info
+                            .configuration_usage_slots
+                            .extend(device_usage_slots);
+                        instance_info
+                            .list_and_watch_message_sender
+                            .send(ListAndWatchMessageKind::Continue)
+                            .unwrap();
+                    });
+            }
+        }
+        trace!(
+            "ConfigurationDevicePlugin::allocate - for Instance {} returning responses",
+            &dps.instance_name
+        );
+        Ok(Response::new(v1beta1::AllocateResponse {
+            container_responses,
+        }))
+    }
+}
+
+fn build_usage_slot_virtual_devices(
+    device_map: HashMap<String, Vec<v1beta1::Device>>,
+) -> HashMap<String, String> {
+    let mut usage_slot_devices = HashMap::new();
+    device_map.values().for_each(|devices| {
+        usage_slot_devices.extend(
+            devices
+                .iter()
+                .map(|device| (device.id.clone(), device.health.clone())),
+        );
+    });
+    usage_slot_devices
+}
+
+// for per-usage slot virtual device, the device id is the device usage id
+// to get the instance name, trim the suffix -xxx from the device usage id
+async fn get_usage_slot_allocation_info(
+    device_id: &str,
+    _config_namespace: &str,
+    _capacity: i32,
+    allocated_instances: &HashMap<String, HashSet<String>>,
+    instance_map: InstanceMap,
+    _kube_interface: Arc<impl KubeInterface + ?Sized>,
+) -> Result<(String, String), Status> {
+    let instance_name: String = match device_id.rfind('-') {
+        Some(pos) => device_id.chars().take(pos).collect(),
+        None => {
+            return Err(Status::new(Code::Unknown, format!("invalid {device_id}")));
+        }
+    };
+    // find device from instance_map
+    let instance_info = match instance_map
+        .read()
+        .await
+        .instances
+        .get(&instance_name)
+        .ok_or_else(|| {
+            Status::new(
+                Code::Unknown,
+                format!("instance {} not found in instance map", instance_name),
+            )
+        }) {
+        Ok(instance_info) => instance_info.clone(),
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    let allocated = match allocated_instances.get(&instance_name) {
+        Some(slots) => slots.contains(device_id),
+        None => false,
+    };
+
+    if allocated || instance_info.configuration_usage_slots.contains(device_id) {
+        return Err(Status::new(
+            Code::Unknown,
+            format!("already allocated for virtual device {}", instance_name),
+        ));
+    }
+
+    Ok((instance_name, device_id.to_string()))
+}
+
+fn build_instance_virtual_devices(
+    device_map: HashMap<String, Vec<v1beta1::Device>>,
+) -> HashMap<String, String> {
+    device_map
+        .iter()
+        .map(|(instance_name, devices)| {
+            let health_state = if devices.iter().any(|device| device.health == *HEALTHY) {
+                HEALTHY
+            } else {
+                UNHEALTHY
+            };
+            (instance_name.clone(), health_state.to_string())
+        })
+        .collect::<HashMap<String, String>>()
+}
+
+// for per-instance virtual device, the device id is the instance name
+// to get the device usage id for allocation first check if already allocated, if yes, return error
+// if not allocated yet, check if any usage slot is free and use it
+// if no free slots, return error
+async fn get_instance_allocation_info(
+    device_id: &str,
+    config_namespace: &str,
+    capacity: i32,
+    allocated_instances: &HashMap<String, HashSet<String>>,
+    instance_map: InstanceMap,
+    kube_interface: Arc<impl KubeInterface + ?Sized>,
+) -> Result<(String, String), Status> {
+    let instance_name = device_id;
+
+    // find device from instance_map
+    let instance_info = match instance_map
+        .read()
+        .await
+        .instances
+        .get(instance_name)
+        .ok_or_else(|| {
+            Status::new(
+                Code::Unknown,
+                format!("instance {} not found in instance map", instance_name),
+            )
+        }) {
+        Ok(instance_info) => instance_info.clone(),
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    let already_allocated: Vec<_> = (0..capacity)
+        .map(|x| format!("{}-{}", instance_name, x))
+        .filter(|id| {
+            if let Some(slots) = allocated_instances.get(instance_name) {
+                if slots.contains(id) {
+                    return true;
+                }
+            }
+            instance_info.configuration_usage_slots.contains(id)
+        })
+        .collect();
+    if !already_allocated.is_empty() {
+        return Err(Status::new(
+            Code::Unknown,
+            format!("already allocated for virtual device {}", instance_name),
+        ));
+    }
+
+    let free_slot = match find_free_instance_device_usage_slot(
+        instance_name,
+        config_namespace,
+        capacity,
+        kube_interface.clone(),
+    )
+    .await
+    {
+        Ok(Some(slot)) => slot,
+        Ok(None) => {
+            return Err(Status::new(Code::Unknown, "no free slot"));
+        }
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    Ok((instance_name.to_string(), free_slot))
+}
+
+async fn find_free_instance_device_usage_slot(
+    instance_name: &str,
+    instance_namespace: &str,
+    capacity: i32,
+    kube_interface: Arc<impl KubeInterface + ?Sized>,
+) -> Result<Option<String>, Status> {
+    let instance_spec = match kube_interface
+        .find_instance(instance_name, instance_namespace)
+        .await
+    {
+        Ok(instance_object) => instance_object.spec,
+        Err(_) => {
+            trace!(
+                "find_free_instance_device_usage_slot - could not find Instance {}",
+                instance_name
+            );
+            return Err(Status::new(
+                Code::Unknown,
+                format!("Could not find Instance {}", instance_name),
+            ));
+        }
+    };
+
+    for x in 0..capacity {
+        let device_usage_id = format!("{}-{}", instance_name, x);
+        if let Some(allocated_node) = instance_spec.device_usage.get(&device_usage_id) {
+            if allocated_node.is_empty() {
+                return Ok(Some(device_usage_id));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// This returns true if this node can reserve a `device_usage_id` slot for an instance
