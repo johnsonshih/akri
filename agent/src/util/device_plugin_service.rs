@@ -303,6 +303,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
             );
 
             let virtual_devices = build_list_and_watch_response(
+                &dps.instance_name,
                 dps.clone(),
                 kube_interface.clone(),
                 |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
@@ -554,6 +555,7 @@ impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
             let mut discovered_devices = HashMap::new();
             for (instance_name, _) in instance_map_snapshot.instances {
                 let virtual_devices = build_list_and_watch_response(
+                    &instance_name,
                     dps.clone(),
                     kube_interface.clone(),
                     |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
@@ -1291,6 +1293,7 @@ async fn try_create_instance(
 /// Returns list of "virtual" Devices and their health.
 /// If the instance is offline, returns all unhealthy virtual Devices.
 async fn build_list_and_watch_response<F>(
+    instance_name: &str,
     dps: Arc<DevicePluginService>,
     kube_interface: Arc<impl KubeInterface + ?Sized>,
     health_predicate: F,
@@ -1300,7 +1303,7 @@ where
 {
     info!(
         "build_list_and_watch_response -- for Instance {} entered",
-        dps.instance_name
+        instance_name
     );
 
     // If instance has been removed from map, send back all unhealthy device slots
@@ -1309,12 +1312,12 @@ where
         .read()
         .await
         .instances
-        .contains_key(&dps.instance_name)
+        .contains_key(instance_name)
     {
-        trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", dps.instance_name);
+        trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
         return Ok(build_unhealthy_virtual_devices(
             dps.config.capacity,
-            &dps.instance_name,
+            instance_name,
         ));
     }
     // If instance is offline, send back all unhealthy device slots
@@ -1323,33 +1326,30 @@ where
         .read()
         .await
         .instances
-        .get(&dps.instance_name)
+        .get(instance_name)
         .unwrap()
         .connectivity_status
         != InstanceConnectivityStatus::Online
     {
-        trace!("build_list_and_watch_response - device for Instance {} is offline ... returning unhealthy devices", dps.instance_name);
+        trace!("build_list_and_watch_response - device for Instance {} is offline ... returning unhealthy devices", instance_name);
         return Ok(build_unhealthy_virtual_devices(
             dps.config.capacity,
-            &dps.instance_name,
+            instance_name,
         ));
     }
 
     trace!(
         "build_list_and_watch_response -- device for Instance {} is online",
-        dps.instance_name
+        instance_name
     );
 
     match kube_interface
-        .find_instance(&dps.instance_name, &dps.config_namespace)
+        .find_instance(instance_name, &dps.config_namespace)
         .await
     {
         Ok(kube_akri_instance) => {
             let mut instance_map_guard = dps.instance_map.write().await;
-            let instance_info = instance_map_guard
-                .instances
-                .get(&dps.instance_name)
-                .unwrap();
+            let instance_info = instance_map_guard.instances.get(instance_name).unwrap();
             let (devices, updated_usage_slots) = build_virtual_devices(
                 &kube_akri_instance.spec.device_usage,
                 kube_akri_instance.spec.shared,
@@ -1364,7 +1364,7 @@ where
             );
             instance_map_guard
                 .instances
-                .entry(dps.instance_name.to_string())
+                .entry(instance_name.to_string())
                 .and_modify(|instance_info| {
                     instance_info.configuration_usage_slots = updated_usage_slots;
                 });
@@ -1372,10 +1372,10 @@ where
             Ok(devices)
         }
         Err(_) => {
-            trace!("build_list_and_watch_response - could not find instance {} so returning unhealthy devices", dps.instance_name);
+            trace!("build_list_and_watch_response - could not find instance {} so returning unhealthy devices", instance_name);
             Ok(build_unhealthy_virtual_devices(
                 dps.config.capacity,
-                &dps.instance_name,
+                instance_name,
             ))
         }
     }
@@ -2048,8 +2048,10 @@ mod device_plugin_service_tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Offline(Instant::now()), true);
+        let instance_name = device_plugin_service.instance_name.clone();
         let mock = MockKubeInterface::new();
         let devices = build_list_and_watch_response(
+            &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
             |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
@@ -2071,15 +2073,17 @@ mod device_plugin_service_tests {
         let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let instance_name = device_plugin_service.instance_name.clone();
+        let instance_name_clone = instance_name.clone();
         let instance_namespace = device_plugin_service.config_namespace.clone();
         let mut mock = MockKubeInterface::new();
         mock.expect_find_instance()
             .times(1)
             .withf(move |name: &str, namespace: &str| {
-                namespace == instance_namespace && name == instance_name
+                namespace == instance_namespace && name == instance_name_clone
             })
             .returning(move |_, _| Err(get_kube_not_found_error().into()));
         let devices = build_list_and_watch_response(
+            &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
             |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
@@ -2112,6 +2116,7 @@ mod device_plugin_service_tests {
             NodeName::ThisNode,
         );
         let devices = build_list_and_watch_response(
+            &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
             |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
