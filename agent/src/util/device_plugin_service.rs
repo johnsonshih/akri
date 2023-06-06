@@ -21,6 +21,8 @@ use akri_shared::{
 use log::{error, info, trace};
 #[cfg(test)]
 use mock_instant::Instant;
+#[cfg(test)]
+use mockall::{automock, predicate::*};
 #[cfg(not(test))]
 use std::time::Instant;
 use std::{
@@ -104,6 +106,7 @@ impl KubeInterfaceProvider {
     }
 }
 
+#[cfg_attr(test, automock)]
 #[tonic::async_trait]
 pub trait DevicePluginServiceBehavior: Send + Sync + 'static {
     async fn list_and_watch(
@@ -1513,9 +1516,14 @@ mod device_plugin_service_tests {
         OtherNode,
     }
 
+    enum DevicePluginKind {
+        Instance,
+    }
+
     // Need to be kept alive during tests
     struct DevicePluginServiceReceivers {
-        list_and_watch_message_receiver: broadcast::Receiver<ListAndWatchMessageKind>,
+        configuration_list_and_watch_message_receiver: broadcast::Receiver<ListAndWatchMessageKind>,
+        instance_list_and_watch_message_receiver: broadcast::Receiver<ListAndWatchMessageKind>,
     }
 
     fn configure_find_instance(
@@ -1558,27 +1566,58 @@ mod device_plugin_service_tests {
     ) {
         let path_to_config = "../test/yaml/config-a.yaml";
         let instance_id = "b494b6";
+        let device = Device {
+            id: "n/a".to_string(),
+            properties: HashMap::from([(
+                "DEVICE_LOCATION_INFO".to_string(),
+                "endpoint".to_string(),
+            )]),
+            mounts: Vec::new(),
+            device_specs: Vec::new(),
+        };
+
+        let (mut dps, receivers) = create_device_plugin_service_common(
+            DevicePluginKind::Instance,
+            path_to_config,
+            instance_id,
+            &device,
+            connectivity_status,
+            add_to_instance_map,
+        );
+        let device_plugin_behavior = Arc::new(InstanceDevicePlugin {
+            instance_id: instance_id.to_string(),
+            shared: false,
+            device,
+        });
+        dps.device_plugin_behavior = device_plugin_behavior.clone();
+        (dps, device_plugin_behavior, receivers)
+    }
+
+    fn create_device_plugin_service_common(
+        device_plugin_kind: DevicePluginKind,
+        path_to_config: &str,
+        instance_id: &str,
+        device: &Device,
+        connectivity_status: InstanceConnectivityStatus,
+        add_to_instance_map: bool,
+    ) -> (DevicePluginService, DevicePluginServiceReceivers) {
         let kube_akri_config_yaml =
             fs::read_to_string(path_to_config).expect("Unable to read file");
         let kube_akri_config: Configuration = serde_yaml::from_str(&kube_akri_config_yaml).unwrap();
         let config_name = kube_akri_config.metadata.name.as_ref().unwrap();
         let device_instance_name = get_device_instance_name(instance_id, config_name);
-        let (list_and_watch_message_sender, list_and_watch_message_receiver) =
+        let (
+            configuration_list_and_watch_message_sender,
+            configuration_list_and_watch_message_receiver,
+        ) = broadcast::channel(4);
+        let (instance_list_and_watch_message_sender, instance_list_and_watch_message_receiver) =
             broadcast::channel(4);
         let (server_ender_sender, _) = mpsc::channel(1);
 
-        let mut properties = HashMap::new();
-        properties.insert("DEVICE_LOCATION_INFO".to_string(), "endpoint".to_string());
-        let device = Device {
-            id: "n/a".to_string(),
-            properties,
-            mounts: Vec::new(),
-            device_specs: Vec::new(),
-        };
         let mut instances = HashMap::new();
         if add_to_instance_map {
             let instance_info: InstanceInfo = InstanceInfo {
-                list_and_watch_message_sender: list_and_watch_message_sender.clone(),
+                list_and_watch_message_sender: instance_list_and_watch_message_sender.clone(),
                 connectivity_status,
                 instance_id: instance_id.to_string(),
                 device: device.clone(),
@@ -1587,14 +1626,12 @@ mod device_plugin_service_tests {
             instances.insert(device_instance_name.clone(), instance_info);
         }
         let instance_map: InstanceMap = Arc::new(RwLock::new(InstanceConfig {
-            usage_update_message_sender: None,
+            usage_update_message_sender: Some(configuration_list_and_watch_message_sender),
             instances,
         }));
-        let device_plugin_behavior = Arc::new(InstanceDevicePlugin {
-            instance_id: instance_id.to_string(),
-            shared: false,
-            device,
-        });
+        let list_and_watch_message_sender = match device_plugin_kind {
+            DevicePluginKind::Instance => instance_list_and_watch_message_sender,
+        };
         let dps = DevicePluginService {
             instance_name: device_instance_name,
             config: kube_akri_config.spec.clone(),
@@ -1605,13 +1642,13 @@ mod device_plugin_service_tests {
             instance_map,
             list_and_watch_message_sender,
             server_ender_sender,
-            device_plugin_behavior: device_plugin_behavior.clone(),
+            device_plugin_behavior: Arc::new(MockDevicePluginServiceBehavior::new()),
         };
         (
             dps,
-            device_plugin_behavior,
             DevicePluginServiceReceivers {
-                list_and_watch_message_receiver,
+                configuration_list_and_watch_message_receiver,
+                instance_list_and_watch_message_receiver,
             },
         )
     }
@@ -2209,9 +2246,17 @@ mod device_plugin_service_tests {
             "endpoint"
         );
         assert!(device_plugin_service_receivers
-            .list_and_watch_message_receiver
+            .instance_list_and_watch_message_receiver
             .try_recv()
             .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
     }
 
     // Test when device_usage[id] == ""
@@ -2234,9 +2279,17 @@ mod device_plugin_service_tests {
             .await
             .is_ok());
         assert!(device_plugin_service_receivers
-            .list_and_watch_message_receiver
+            .instance_list_and_watch_message_receiver
             .try_recv()
             .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
     }
 
     // Test when device_usage[id] == self.nodeName
@@ -2259,9 +2312,17 @@ mod device_plugin_service_tests {
             .await
             .is_ok());
         assert!(device_plugin_service_receivers
-            .list_and_watch_message_receiver
+            .instance_list_and_watch_message_receiver
             .try_recv()
             .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
     }
 
     // Tests when device_usage[id] == <another node>
@@ -2295,12 +2356,16 @@ mod device_plugin_service_tests {
         }
         assert_eq!(
             device_plugin_service_receivers
-                .list_and_watch_message_receiver
+                .instance_list_and_watch_message_receiver
                 .recv()
                 .await
                 .unwrap(),
             ListAndWatchMessageKind::Continue
         );
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
     }
 
     // Tests when instance does not have the requested device usage id
@@ -2334,11 +2399,15 @@ mod device_plugin_service_tests {
         }
         assert_eq!(
             device_plugin_service_receivers
-                .list_and_watch_message_receiver
+                .instance_list_and_watch_message_receiver
                 .recv()
                 .await
                 .unwrap(),
             ListAndWatchMessageKind::Continue
         );
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
     }
 }
