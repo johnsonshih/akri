@@ -265,7 +265,7 @@ impl DevicePluginBuilder {
         self.register(
             &capability_id,
             &device_endpoint,
-            &device_plugin_name,
+            device_plugin_name,
             server_ender_sender,
             KUBELET_SOCKET,
         )
