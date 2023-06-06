@@ -440,7 +440,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                             format!("instance {} not found in instance map", dps.instance_name),
                         )
                     }) {
-                    Ok(instance_info) => instance_info
+                    Ok(instance_info) => !instance_info
                         .configuration_usage_slots
                         .contains(&device_usage_id),
 
