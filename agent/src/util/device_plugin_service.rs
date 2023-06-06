@@ -1641,6 +1641,22 @@ mod device_plugin_service_tests {
         })
     }
 
+    // Tests that configuration device plugin names are formatted correctly
+    #[test]
+    fn test_get_device_configuration_name() {
+        let names_to_test = vec![
+            ("no_dash_no_dot", "no_dash_no_dot"),
+            ("usb/camera", "usb-camera"),
+            ("another//camera", "another--camera"),
+            ("name.with.dot", "name-with-dot"),
+            ("name.with..dots...", "name-with--dots---"),
+        ];
+        names_to_test.iter().for_each(|(test, expected)| {
+            println!("{:?}", (test, expected));
+            assert_eq!(get_device_configuration_name(test), expected.to_string());
+        });
+    }
+
     // Tests that instance names are formatted correctly
     #[test]
     fn test_get_device_instance_name() {
