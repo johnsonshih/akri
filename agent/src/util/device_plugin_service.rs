@@ -748,7 +748,7 @@ impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
                 if let Err(e) = try_update_instance_device_usage(
                     &device_usage_id,
                     &dps.node_name,
-                    &dps.instance_name,
+                    &instance_name,
                     &dps.config_namespace,
                     allow_dup_reserve,
                     kube_interface.clone(),
