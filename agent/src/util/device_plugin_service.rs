@@ -1536,10 +1536,11 @@ mod device_plugin_service_tests {
         instance_namespace: String,
         device_usage_node: String,
         node_name: NodeName,
+        expected_calls: usize,
     ) {
         let instance_name_clone = instance_name.clone();
         mock.expect_find_instance()
-            .times(1)
+            .times(expected_calls)
             .withf(move |name: &str, namespace: &str| {
                 namespace == instance_namespace && name == instance_name
             })
@@ -1818,6 +1819,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             String::new(),
             NodeName::OtherNode,
+            1,
         );
         let instance_name = device_plugin_service.instance_name.clone();
         let config_namespace = device_plugin_service.config_namespace.clone();
@@ -1864,6 +1866,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             String::new(),
             NodeName::ThisNode,
+            1,
         );
         let dps = Arc::new(device_plugin_service);
         assert!(
@@ -2171,6 +2174,7 @@ mod device_plugin_service_tests {
             instance_namespace.clone(),
             String::new(),
             NodeName::ThisNode,
+            1,
         );
         let devices = build_list_and_watch_response(
             &instance_name,
@@ -2201,6 +2205,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             formerly_allocated_node,
             NodeName::ThisNode,
+            1,
         );
         if let Some(new_node) = newly_allocated_node {
             mock.expect_update_instance()
@@ -2345,6 +2350,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             "other".to_string(),
             NodeName::ThisNode,
+            1,
         );
         let devices_i_ds = vec![device_usage_id_slot];
         let container_requests = vec![v1beta1::ContainerAllocateRequest { devices_i_ds }];
@@ -2388,6 +2394,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             "other".to_string(),
             NodeName::ThisNode,
+            1,
         );
         let devices_i_ds = vec![device_usage_id_slot];
         let container_requests = vec![v1beta1::ContainerAllocateRequest { devices_i_ds }];
@@ -2521,6 +2528,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             String::new(),
             NodeName::OtherNode,
+            1,
         );
         let instance_name = device_plugin_service
             .instance_map
@@ -2567,6 +2575,7 @@ mod device_plugin_service_tests {
             device_plugin_service.config_namespace.clone(),
             String::new(),
             NodeName::OtherNode,
+            1,
         );
         let instance_name = device_plugin_service
             .instance_map
@@ -2604,5 +2613,199 @@ mod device_plugin_service_tests {
                     device.id
                 )
             });
+    }
+
+    fn setup_configuration_internal_allocate_tests(
+        mock: &mut MockKubeInterface,
+        configuration_resource_from: ConfigurationResourceFrom,
+        config_namespace: &str,
+        instance_name: &str,
+        formerly_allocated_node: String,
+        newly_allocated_node: Option<String>,
+        expected_calls: usize,
+    ) -> Request<AllocateRequest> {
+        let device_usage_id_slot = format!("{}-0", instance_name);
+        let request_device_id = match configuration_resource_from {
+            ConfigurationResourceFrom::Instance => instance_name.to_string(),
+            ConfigurationResourceFrom::DeviceUsage => device_usage_id_slot.clone(),
+        };
+        configure_find_instance(
+            mock,
+            "../test/json/local-instance.json",
+            instance_name.to_string(),
+            config_namespace.to_string(),
+            formerly_allocated_node,
+            NodeName::ThisNode,
+            expected_calls,
+        );
+        if let Some(new_node) = newly_allocated_node {
+            mock.expect_update_instance()
+                .times(1)
+                .withf(move |instance_to_update: &InstanceSpec, _, _| {
+                    instance_to_update
+                        .device_usage
+                        .get(&device_usage_id_slot)
+                        .unwrap()
+                        == &new_node
+                })
+                .returning(move |_, _, _| Ok(()));
+        }
+        let devices_i_ds = vec![request_device_id];
+        let container_requests = vec![v1beta1::ContainerAllocateRequest { devices_i_ds }];
+        Request::new(AllocateRequest { container_requests })
+    }
+
+    // Test that environment variables set in a Configuration will be set in brokers
+    #[tokio::test]
+    async fn test_cdps_from_instance_internal_allocate_env_vars() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::Instance;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let node_name = device_plugin_service.node_name.clone();
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            &instance_name,
+            "".to_string(),
+            Some(node_name),
+            2,
+        );
+        let broker_envs = device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .unwrap()
+            .into_inner()
+            .container_responses[0]
+            .envs
+            .clone();
+        assert_eq!(broker_envs.get("RESOLUTION_WIDTH").unwrap(), "800");
+        assert_eq!(broker_envs.get("RESOLUTION_HEIGHT").unwrap(), "600");
+        // Check that Device properties are set as env vars by checking for
+        // property of device created in `create_configuration_device_plugin_service`
+        assert_eq!(
+            broker_envs.get("DEVICE_LOCATION_INFO_B494B6").unwrap(),
+            "endpoint"
+        );
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .instance_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+        let expected_usage_slots: HashSet<String> =
+            vec![format!("{}-0", instance_name)].into_iter().collect();
+        assert_eq!(
+            expected_usage_slots,
+            device_plugin_service
+                .instance_map
+                .read()
+                .await
+                .instances
+                .get(&instance_name)
+                .unwrap()
+                .configuration_usage_slots
+        );
+    }
+
+    // Test that environment variables set in a Configuration will be set in brokers
+    #[tokio::test]
+    async fn test_cdps_from_device_usage_internal_allocate_env_vars() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::DeviceUsage;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let node_name = device_plugin_service.node_name.clone();
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            &instance_name,
+            "".to_string(),
+            Some(node_name),
+            1,
+        );
+        let broker_envs = device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .unwrap()
+            .into_inner()
+            .container_responses[0]
+            .envs
+            .clone();
+        assert_eq!(broker_envs.get("RESOLUTION_WIDTH").unwrap(), "800");
+        assert_eq!(broker_envs.get("RESOLUTION_HEIGHT").unwrap(), "600");
+        // Check that Device properties are set as env vars by checking for
+        // property of device created in `create_configuration_device_plugin_service`
+        assert_eq!(
+            broker_envs.get("DEVICE_LOCATION_INFO_B494B6").unwrap(),
+            "endpoint"
+        );
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .instance_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+        let expected_usage_slots: HashSet<String> =
+            vec![format!("{}-0", instance_name)].into_iter().collect();
+        assert_eq!(
+            expected_usage_slots,
+            device_plugin_service
+                .instance_map
+                .read()
+                .await
+                .instances
+                .get(&instance_name)
+                .unwrap()
+                .configuration_usage_slots
+        );
     }
 }
