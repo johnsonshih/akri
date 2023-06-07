@@ -2939,4 +2939,128 @@ mod device_plugin_service_tests {
                 .configuration_usage_slots
         );
     }
+
+    // Test when device_usage[id] == self.nodeName
+    // Expected behavior: internal_allocate should return success, this can happen when
+    // a device is allocated for a work load, after the work load finishs and exits
+    // the device plugin framework will re-allocate the device for other work loads to use
+    #[tokio::test]
+    async fn test_cdps_from_instance_internal_reallocate() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::Instance;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let node_name = device_plugin_service.node_name.clone();
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let expected_usage_slots: HashSet<String> =
+            vec![format!("{}-0", instance_name)].into_iter().collect();
+        device_plugin_service
+            .instance_map
+            .write()
+            .await
+            .instances
+            .entry(instance_name.to_string())
+            .and_modify(|instance_info| {
+                instance_info.configuration_usage_slots = expected_usage_slots;
+            });
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            &instance_name,
+            node_name,
+            None,
+            0,
+        );
+        assert!(device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+    }
+
+    // Test when device_usage[id] == self.nodeName
+    // Expected behavior: internal_allocate should return success, this can happen when
+    // a device is allocated for a work load, after the work load finishs and exits
+    // the device plugin framework will re-allocate the device for other work loads to use
+    #[tokio::test]
+    async fn test_cdps_from_device_usage_internal_reallocate() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::DeviceUsage;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let node_name = device_plugin_service.node_name.clone();
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let expected_usage_slots: HashSet<String> =
+            vec![format!("{}-0", instance_name)].into_iter().collect();
+        device_plugin_service
+            .instance_map
+            .write()
+            .await
+            .instances
+            .entry(instance_name.to_string())
+            .and_modify(|instance_info| {
+                instance_info.configuration_usage_slots = expected_usage_slots;
+            });
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            &instance_name,
+            node_name,
+            None,
+            0,
+        );
+        assert!(device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+    }
 }
