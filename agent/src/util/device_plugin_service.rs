@@ -1506,7 +1506,9 @@ mod device_plugin_service_tests {
         akri::instance::{Instance, InstanceSpec},
         k8s::MockKubeInterface,
     };
+    use regex::Regex;
     use std::{
+        convert::TryInto,
         fs,
         io::{Error, ErrorKind},
     };
@@ -2543,5 +2545,64 @@ mod device_plugin_service_tests {
         let list_and_watch_response = result.unwrap();
         assert_eq!(list_and_watch_response.devices.len(), 1);
         assert_eq!(list_and_watch_response.devices[0].id, instance_name);
+    }
+
+    // configuration resource from deviceUsage, instance available, should return device id == device usage slot
+    #[tokio::test]
+    async fn test_cdps_from_device_usage_list_and_watch_with_instance() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                ConfigurationResourceFrom::DeviceUsage,
+            );
+        let list_and_watch_message_sender =
+            device_plugin_service.list_and_watch_message_sender.clone();
+        let mut mock = MockKubeInterface::new();
+        configure_find_instance(
+            &mut mock,
+            "../test/json/local-instance.json",
+            device_plugin_service.instance_name.clone(),
+            device_plugin_service.config_namespace.clone(),
+            String::new(),
+            NodeName::OtherNode,
+        );
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let expected_device_count: usize =
+            device_plugin_service.config.capacity.try_into().unwrap();
+
+        let stream = device_plugin_service
+            .internal_list_and_watch(Arc::new(mock))
+            .await
+            .unwrap()
+            .into_inner();
+        list_and_watch_message_sender
+            .send(ListAndWatchMessageKind::End)
+            .unwrap();
+
+        let result = stream.into_inner().recv().await.unwrap();
+        let list_and_watch_response = result.unwrap();
+        assert_eq!(list_and_watch_response.devices.len(), expected_device_count);
+        let device_usage_id_pattern = format!("{}-[0-9]{{1,}}$", instance_name);
+        let regex_pattern = Regex::new(&device_usage_id_pattern).unwrap();
+        list_and_watch_response
+            .devices
+            .into_iter()
+            .for_each(|device| {
+                assert!(
+                    regex_pattern.is_match(&device.id),
+                    "invalid device id {}",
+                    device.id
+                )
+            });
     }
 }
