@@ -861,45 +861,16 @@ async fn get_usage_slot_allocation_info(
     device_id: &str,
     _config_namespace: &str,
     _capacity: i32,
-    allocated_instances: &HashMap<String, HashSet<String>>,
-    instance_map: InstanceMap,
+    _allocated_instances: &HashMap<String, HashSet<String>>,
+    _instance_map: InstanceMap,
     _kube_interface: Arc<impl KubeInterface + ?Sized>,
 ) -> Result<(String, String), Status> {
     let instance_name: String = match device_id.rfind('-') {
         Some(pos) => device_id.chars().take(pos).collect(),
         None => {
-            return Err(Status::new(Code::Unknown, format!("invalid {device_id}")));
+            return Err(Status::new(Code::Unknown, format!("invalid {}", device_id)));
         }
     };
-    // find device from instance_map
-    let instance_info = match instance_map
-        .read()
-        .await
-        .instances
-        .get(&instance_name)
-        .ok_or_else(|| {
-            Status::new(
-                Code::Unknown,
-                format!("instance {} not found in instance map", instance_name),
-            )
-        }) {
-        Ok(instance_info) => instance_info.clone(),
-        Err(e) => {
-            return Err(e);
-        }
-    };
-    let allocated = match allocated_instances.get(&instance_name) {
-        Some(slots) => slots.contains(device_id),
-        None => false,
-    };
-
-    if allocated || instance_info.configuration_usage_slots.contains(device_id) {
-        return Err(Status::new(
-            Code::Unknown,
-            format!("already allocated for virtual device {}", instance_name),
-        ));
-    }
-
     Ok((instance_name, device_id.to_string()))
 }
 
@@ -962,10 +933,7 @@ async fn get_instance_allocation_info(
         })
         .collect();
     if !already_allocated.is_empty() {
-        return Err(Status::new(
-            Code::Unknown,
-            format!("already allocated for virtual device {}", instance_name),
-        ));
+        return Ok((instance_name.to_string(), already_allocated[0].clone()));
     }
 
     let free_slot = match find_free_instance_device_usage_slot(
@@ -3117,20 +3085,16 @@ mod device_plugin_service_tests {
             &instance_name,
             node_name,
             None,
-            0,
+            1,
         );
         assert!(device_plugin_service
             .internal_allocate(request, Arc::new(mock))
             .await
+            .is_ok());
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
             .is_err());
-        assert_eq!(
-            device_plugin_service_receivers
-                .configuration_list_and_watch_message_receiver
-                .recv()
-                .await
-                .unwrap(),
-            ListAndWatchMessageKind::Continue
-        );
     }
 
     // Test when device_usage[id] == self.nodeName
@@ -3179,20 +3143,16 @@ mod device_plugin_service_tests {
             &instance_name,
             node_name,
             None,
-            0,
+            1,
         );
         assert!(device_plugin_service
             .internal_allocate(request, Arc::new(mock))
             .await
+            .is_ok());
+        assert!(device_plugin_service_receivers
+            .configuration_list_and_watch_message_receiver
+            .try_recv()
             .is_err());
-        assert_eq!(
-            device_plugin_service_receivers
-                .configuration_list_and_watch_message_receiver
-                .recv()
-                .await
-                .unwrap(),
-            ListAndWatchMessageKind::Continue
-        );
     }
 
     // Tests when device_usage[id] == <another node>
