@@ -2473,4 +2473,29 @@ mod device_plugin_service_tests {
             .unwrap();
         assert!(stream.into_inner().try_recv().is_err());
     }
+
+    // configuration resource from deviceUsage, no instance available, should receive nothing from the response stream
+    #[tokio::test]
+    async fn test_cdps_from_device_usage_list_and_watch_no_instance() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                false,
+                ConfigurationResourceFrom::DeviceUsage,
+            );
+        let list_and_watch_message_sender =
+            device_plugin_service.list_and_watch_message_sender.clone();
+        let mock = MockKubeInterface::new();
+
+        let stream = device_plugin_service
+            .internal_list_and_watch(Arc::new(mock))
+            .await
+            .unwrap()
+            .into_inner();
+        list_and_watch_message_sender
+            .send(ListAndWatchMessageKind::End)
+            .unwrap();
+        assert!(stream.into_inner().try_recv().is_err());
+    }
 }
