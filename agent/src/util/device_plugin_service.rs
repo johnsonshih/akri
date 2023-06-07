@@ -310,7 +310,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                 dps.clone(),
                 kube_interface.clone(),
                 |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
-                    // device is healthy if not reserved by Configuration
+                    // allow reallocate if not reserved by Configuration
                     !configuration_usage_slots.contains(device_usage_id)
                 },
             )
@@ -431,8 +431,9 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                     device_usage_id
                 );
 
-                // only allow duplicate reserve if the slot is not reserved by Configuration
-                let allow_dup_reserve = match dps
+                // if the slot already reserved by this node,
+                // only allow reallocate if the slot is not reserved by Configuration
+                let allow_reallocate = match dps
                     .instance_map
                     .read()
                     .await
@@ -461,7 +462,7 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
                     &dps.node_name,
                     &dps.instance_name,
                     &dps.config_namespace,
-                    allow_dup_reserve,
+                    allow_reallocate,
                     kube_interface.clone(),
                 )
                 .await
@@ -562,7 +563,7 @@ impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
                     dps.clone(),
                     kube_interface.clone(),
                     |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
-                        // device is healthy if reserved by Configuration
+                        // allow reallocate if reserved by Configuration
                         configuration_usage_slots.contains(device_usage_id)
                     },
                 )
@@ -1299,7 +1300,7 @@ async fn build_list_and_watch_response<F>(
     instance_name: &str,
     dps: Arc<DevicePluginService>,
     kube_interface: Arc<impl KubeInterface + ?Sized>,
-    health_predicate: F,
+    reallocate_predicate: F,
 ) -> Result<Vec<v1beta1::Device>, Box<dyn std::error::Error + Send + Sync + 'static>>
 where
     F: Fn(&str, &HashSet<String>) -> bool,
@@ -1358,7 +1359,7 @@ where
                 kube_akri_instance.spec.shared,
                 &dps.node_name,
                 &instance_info.configuration_usage_slots,
-                health_predicate,
+                reallocate_predicate,
             );
             // update cl_usage_slot based on new instance information
             trace!(
@@ -1410,7 +1411,7 @@ fn build_virtual_devices<F>(
     shared: bool,
     node_name: &str,
     configuration_usage_slots: &HashSet<String>,
-    health_predicate: F,
+    reallocate_predicate: F,
 ) -> (Vec<v1beta1::Device>, HashSet<String>)
 where
     F: Fn(&str, &HashSet<String>) -> bool,
@@ -1425,7 +1426,8 @@ where
             }
             false
         } else {
-            allocated_node.is_empty() || health_predicate(device_name, configuration_usage_slots)
+            allocated_node.is_empty()
+                || reallocate_predicate(device_name, configuration_usage_slots)
         };
 
         // remove the device from the current usage slot if it is not reserved by any node
