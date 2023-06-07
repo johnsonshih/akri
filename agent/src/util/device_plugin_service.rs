@@ -2498,4 +2498,50 @@ mod device_plugin_service_tests {
             .unwrap();
         assert!(stream.into_inner().try_recv().is_err());
     }
+
+    // configuration resource from instance, instance available, should return device id == instance_name
+    #[tokio::test]
+    async fn test_cdps_from_instance_list_and_watch_with_instance() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                ConfigurationResourceFrom::Instance,
+            );
+        let list_and_watch_message_sender =
+            device_plugin_service.list_and_watch_message_sender.clone();
+        let mut mock = MockKubeInterface::new();
+        configure_find_instance(
+            &mut mock,
+            "../test/json/local-instance.json",
+            device_plugin_service.instance_name.clone(),
+            device_plugin_service.config_namespace.clone(),
+            String::new(),
+            NodeName::OtherNode,
+        );
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+
+        let stream = device_plugin_service
+            .internal_list_and_watch(Arc::new(mock))
+            .await
+            .unwrap()
+            .into_inner();
+        list_and_watch_message_sender
+            .send(ListAndWatchMessageKind::End)
+            .unwrap();
+
+        let result = stream.into_inner().recv().await.unwrap();
+        let list_and_watch_response = result.unwrap();
+        assert_eq!(list_and_watch_response.devices.len(), 1);
+        assert_eq!(list_and_watch_response.devices[0].id, instance_name);
+    }
 }
