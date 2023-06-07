@@ -3257,4 +3257,89 @@ mod device_plugin_service_tests {
             ListAndWatchMessageKind::Continue
         );
     }
+    // Tests when instance does not have the requested device usage id
+    // Expected behavior: should invoke list_and_watch, and return error
+    #[tokio::test]
+    async fn test_cdps_from_instance_internal_allocate_no_id() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::Instance;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            "NotExistingInstance",
+            "".to_string(),
+            None,
+            0,
+        );
+        assert!(device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+        assert!(device_plugin_service_receivers
+            .instance_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
+    }
+
+    // Tests when instance does not have the requested device usage id
+    // Expected behavior: should invoke list_and_watch, and return error
+    #[tokio::test]
+    async fn test_cdps_from_device_usage_internal_allocate_no_id() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let configuration_resource_from = ConfigurationResourceFrom::DeviceUsage;
+        let (
+            device_plugin_service,
+            _configuration_device_plugin,
+            mut device_plugin_service_receivers,
+        ) = create_configuration_device_plugin_service(
+            InstanceConnectivityStatus::Online,
+            true,
+            configuration_resource_from.clone(),
+        );
+        let mut mock = MockKubeInterface::new();
+        let request = setup_configuration_internal_allocate_tests(
+            &mut mock,
+            configuration_resource_from,
+            &device_plugin_service.config_namespace,
+            "NotExistingInstance",
+            "".to_string(),
+            None,
+            0,
+        );
+        assert!(device_plugin_service
+            .internal_allocate(request, Arc::new(mock))
+            .await
+            .is_err());
+        assert_eq!(
+            device_plugin_service_receivers
+                .configuration_list_and_watch_message_receiver
+                .recv()
+                .await
+                .unwrap(),
+            ListAndWatchMessageKind::Continue
+        );
+        assert!(device_plugin_service_receivers
+            .instance_list_and_watch_message_receiver
+            .try_recv()
+            .is_err());
+    }
 }
