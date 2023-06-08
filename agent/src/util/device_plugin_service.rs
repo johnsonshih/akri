@@ -921,7 +921,7 @@ async fn get_instance_allocation_info(
             return Err(e);
         }
     };
-    let already_allocated: Vec<_> = (0..capacity)
+    if let Some(allocated_slot) = (0..capacity)
         .map(|x| format!("{}-{}", instance_name, x))
         .filter(|id| {
             if let Some(slots) = allocated_instances.get(instance_name) {
@@ -931,15 +931,16 @@ async fn get_instance_allocation_info(
             }
             instance_info.configuration_usage_slots.contains(id)
         })
-        .collect();
-    if !already_allocated.is_empty() {
-        return Ok((instance_name.to_string(), already_allocated[0].clone()));
+        .collect::<Vec<_>>()
+        .first()
+        .cloned()
+    {
+        return Ok((instance_name.to_string(), allocated_slot));
     }
 
     let free_slot = match find_free_instance_device_usage_slot(
         instance_name,
         config_namespace,
-        capacity,
         kube_interface.clone(),
     )
     .await
@@ -958,7 +959,6 @@ async fn get_instance_allocation_info(
 async fn find_free_instance_device_usage_slot(
     instance_name: &str,
     instance_namespace: &str,
-    capacity: i32,
     kube_interface: Arc<impl KubeInterface + ?Sized>,
 ) -> Result<Option<String>, Status> {
     let instance_spec = match kube_interface
@@ -978,7 +978,9 @@ async fn find_free_instance_device_usage_slot(
         }
     };
 
-    for x in 0..capacity {
+    // find first free usage slot from instance spec
+    // always start searching from 0, easier to predict
+    for x in 0..instance_spec.device_usage.len() {
         let device_usage_id = format!("{}-{}", instance_name, x);
         if let Some(allocated_node) = instance_spec.device_usage.get(&device_usage_id) {
             if allocated_node.is_empty() {
