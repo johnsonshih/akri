@@ -4,8 +4,8 @@ use super::{
         KUBELET_SOCKET, LIST_AND_WATCH_MESSAGE_CHANNEL_CAPACITY,
     },
     device_plugin_service::{
-        ConfigurationDevicePlugin, DevicePluginService, DevicePluginServiceBehavior,
-        InstanceDevicePlugin, InstanceMap, ListAndWatchMessageKind,
+        ConfigurationDevicePlugin, DevicePluginKind, DevicePluginService, InstanceDevicePlugin,
+        InstanceMap, ListAndWatchMessageKind,
     },
     v1beta1,
     v1beta1::{
@@ -23,7 +23,7 @@ use futures::TryFutureExt;
 use log::{info, trace};
 #[cfg(test)]
 use mockall::{automock, predicate::*};
-use std::{convert::TryFrom, env, path::Path, sync::Arc, time::SystemTime};
+use std::{convert::TryFrom, env, path::Path, time::SystemTime};
 use tokio::{
     net::UnixListener,
     net::UnixStream,
@@ -73,7 +73,7 @@ impl DevicePluginBuilderInterface for DevicePluginBuilder {
         device: Device,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         info!("build_device_plugin - entered for device {}", instance_name);
-        let device_plugin_behavior = Arc::new(InstanceDevicePlugin {
+        let device_plugin_behavior = DevicePluginKind::Instance(InstanceDevicePlugin {
             instance_id: instance_id.clone(),
             shared,
             device: device.clone(),
@@ -104,7 +104,7 @@ impl DevicePluginBuilderInterface for DevicePluginBuilder {
             "build_configuration_device_plugin - entered for device {}",
             device_plugin_name
         );
-        let device_plugin_behavior = Arc::new(ConfigurationDevicePlugin {});
+        let device_plugin_behavior = DevicePluginKind::Configuration(ConfigurationDevicePlugin {});
         let (list_and_watch_message_sender, _) =
             broadcast::channel(LIST_AND_WATCH_MESSAGE_CHANNEL_CAPACITY);
         self.build_device_plugin_service(
@@ -228,7 +228,7 @@ impl DevicePluginBuilder {
         device_plugin_name: &str,
         config: &Configuration,
         instance_map: InstanceMap,
-        device_plugin_behavior: Arc<impl DevicePluginServiceBehavior>,
+        device_plugin_behavior: DevicePluginKind,
         list_and_watch_message_sender: broadcast::Sender<ListAndWatchMessageKind>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         let capability_id: String = format!("{}/{}", AKRI_PREFIX, device_plugin_name);

@@ -21,8 +21,6 @@ use akri_shared::{
 use log::{error, info, trace};
 #[cfg(test)]
 use mock_instant::Instant;
-#[cfg(test)]
-use mockall::{automock, predicate::*};
 #[cfg(not(test))]
 use std::time::Instant;
 use std::{
@@ -92,37 +90,9 @@ impl InstanceConfig {
 pub type InstanceMap = Arc<RwLock<InstanceConfig>>;
 
 #[derive(Clone)]
-pub struct KubeInterfaceProvider {
-    kube_interface: Arc<dyn KubeInterface>,
-}
-
-impl KubeInterfaceProvider {
-    pub fn new(kube_interface: Arc<dyn KubeInterface>) -> Self {
-        KubeInterfaceProvider { kube_interface }
-    }
-
-    pub fn get_kube_interface(&self) -> Arc<dyn KubeInterface> {
-        self.kube_interface.clone()
-    }
-}
-
-#[cfg_attr(test, automock)]
-#[tonic::async_trait]
-pub trait DevicePluginServiceBehavior: Send + Sync + 'static {
-    async fn list_and_watch(
-        &self,
-        dps: Arc<DevicePluginService>,
-        kube_interface_provider: &KubeInterfaceProvider,
-        kubelet_update_sender: mpsc::Sender<Result<ListAndWatchResponse, Status>>,
-        polling_interval_secs: u64,
-    );
-
-    async fn allocate(
-        &self,
-        dps: Arc<DevicePluginService>,
-        requests: Request<AllocateRequest>,
-        kube_interface_provider: &KubeInterfaceProvider,
-    ) -> Result<Response<AllocateResponse>, Status>;
+pub enum DevicePluginKind {
+    Configuration(ConfigurationDevicePlugin),
+    Instance(InstanceDevicePlugin),
 }
 
 /// Kubernetes Device-Plugin for an Instance.
@@ -156,8 +126,8 @@ pub struct DevicePluginService {
     pub list_and_watch_message_sender: broadcast::Sender<ListAndWatchMessageKind>,
     /// Upon send, terminates function that acts as the shutdown signal for this service
     pub server_ender_sender: mpsc::Sender<()>,
-    /// Trait object that defines the behavior of the device plugin
-    pub device_plugin_behavior: Arc<dyn DevicePluginServiceBehavior>,
+    /// enum object that defines the behavior of the device plugin
+    pub device_plugin_behavior: DevicePluginKind,
 }
 
 #[tonic::async_trait]
@@ -234,15 +204,26 @@ impl DevicePluginService {
             mpsc::channel(KUBELET_UPDATE_CHANNEL_CAPACITY);
         // Spawn thread so can send kubelet the receiving end of the channel to listen on
         tokio::spawn(async move {
-            let kube_interface_provider = KubeInterfaceProvider::new(kube_interface);
-            dps.device_plugin_behavior
-                .list_and_watch(
-                    dps.clone(),
-                    &kube_interface_provider,
-                    kubelet_update_sender,
-                    LIST_AND_WATCH_SLEEP_SECS,
-                )
-                .await
+            match &dps.device_plugin_behavior {
+                DevicePluginKind::Configuration(dp) => {
+                    dp.list_and_watch(
+                        dps.clone(),
+                        kube_interface,
+                        kubelet_update_sender,
+                        LIST_AND_WATCH_SLEEP_SECS,
+                    )
+                    .await
+                }
+                DevicePluginKind::Instance(dp) => {
+                    dp.list_and_watch(
+                        dps.clone(),
+                        kube_interface,
+                        kubelet_update_sender,
+                        LIST_AND_WATCH_SLEEP_SECS,
+                    )
+                    .await
+                }
+            }
         });
         Ok(Response::new(ReceiverStream::new(kubelet_update_receiver)))
     }
@@ -250,16 +231,20 @@ impl DevicePluginService {
     /// Called when kubelet is trying to reserve for this node a usage slot (or virtual device) of the Instance.
     /// Tries to update Instance CRD to reserve the requested slot. If cannot reserve that slot, forces `list_and_watch` to continue
     /// (sending kubelet the latest list of slots) and returns error, so kubelet will not schedule the pod to this node.
-    async fn internal_allocate<'a>(
+    async fn internal_allocate(
         &self,
         requests: Request<AllocateRequest>,
-        kube_interface: Arc<impl KubeInterface + 'a + 'static>,
+        kube_interface: Arc<impl KubeInterface>,
     ) -> Result<Response<AllocateResponse>, Status> {
         let dps = Arc::new(self.clone());
-        let kube_interface_provider = KubeInterfaceProvider::new(kube_interface);
-        self.device_plugin_behavior
-            .allocate(dps, requests, &kube_interface_provider)
-            .await
+        match &dps.device_plugin_behavior {
+            DevicePluginKind::Configuration(dp) => {
+                dp.allocate(dps.clone(), requests, kube_interface).await
+            }
+            DevicePluginKind::Instance(dp) => {
+                dp.allocate(dps.clone(), requests, kube_interface).await
+            }
+        }
     }
 }
 
@@ -275,17 +260,15 @@ pub struct InstanceDevicePlugin {
     pub device: Device,
 }
 
-#[tonic::async_trait]
-impl DevicePluginServiceBehavior for InstanceDevicePlugin {
+impl InstanceDevicePlugin {
     async fn list_and_watch(
         &self,
         dps: Arc<DevicePluginService>,
-        kube_interface_provider: &KubeInterfaceProvider,
+        kube_interface: Arc<impl KubeInterface>,
         kubelet_update_sender: mpsc::Sender<Result<ListAndWatchResponse, Status>>,
         polling_interval_secs: u64,
     ) {
         let mut list_and_watch_message_receiver = dps.list_and_watch_message_sender.subscribe();
-        let kube_interface = kube_interface_provider.get_kube_interface();
         let mut keep_looping = true;
         // Try to create an Instance CRD for this plugin and add it to the global InstanceMap else shutdown
         if let Err(e) = try_create_instance(dps.clone(), self, kube_interface.clone()).await {
@@ -408,9 +391,8 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
         &self,
         dps: Arc<DevicePluginService>,
         requests: Request<AllocateRequest>,
-        kube_interface_provider: &KubeInterfaceProvider,
+        kube_interface: Arc<impl KubeInterface>,
     ) -> Result<Response<AllocateResponse>, Status> {
-        let kube_interface = kube_interface_provider.get_kube_interface();
         let mut container_responses: Vec<v1beta1::ContainerAllocateResponse> = Vec::new();
         // suffix to add to each device property
         let device_property_suffix = self.instance_id.to_uppercase();
@@ -533,17 +515,15 @@ impl DevicePluginServiceBehavior for InstanceDevicePlugin {
 #[derive(Clone)]
 pub struct ConfigurationDevicePlugin {}
 
-#[tonic::async_trait]
-impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
+impl ConfigurationDevicePlugin {
     async fn list_and_watch(
         &self,
         dps: Arc<DevicePluginService>,
-        kube_interface_provider: &KubeInterfaceProvider,
+        kube_interface: Arc<impl KubeInterface>,
         kubelet_update_sender: mpsc::Sender<Result<ListAndWatchResponse, Status>>,
         polling_interval_secs: u64,
     ) {
         let mut list_and_watch_message_receiver = dps.list_and_watch_message_sender.subscribe();
-        let kube_interface = kube_interface_provider.get_kube_interface();
         let build_virtual_devices_list = if dps.config.unique_devices {
             build_instance_virtual_devices
         } else {
@@ -668,9 +648,8 @@ impl DevicePluginServiceBehavior for ConfigurationDevicePlugin {
         &self,
         dps: Arc<DevicePluginService>,
         requests: Request<AllocateRequest>,
-        kube_interface_provider: &KubeInterfaceProvider,
+        kube_interface: Arc<impl KubeInterface>,
     ) -> Result<Response<AllocateResponse>, Status> {
-        let kube_interface = kube_interface_provider.get_kube_interface();
         let mut container_responses: Vec<v1beta1::ContainerAllocateResponse> = Vec::new();
         let mut allocated_instances: HashMap<String, HashSet<String>> = HashMap::new();
         for request in requests.into_inner().container_requests {
@@ -1488,7 +1467,7 @@ mod device_plugin_service_tests {
         OtherNode,
     }
 
-    enum DevicePluginKind {
+    enum DevicePluginKindTest {
         Configuration,
         Instance,
     }
@@ -1531,50 +1510,12 @@ mod device_plugin_service_tests {
     }
 
     fn create_device_plugin_service(
-        connectivity_status: InstanceConnectivityStatus,
-        add_to_instance_map: bool,
-    ) -> (
-        DevicePluginService,
-        Arc<InstanceDevicePlugin>,
-        DevicePluginServiceReceivers,
-    ) {
-        let path_to_config = "../test/yaml/config-a.yaml";
-        let instance_id = "b494b6";
-        let device = Device {
-            id: "n/a".to_string(),
-            properties: HashMap::from([(
-                "DEVICE_LOCATION_INFO".to_string(),
-                "endpoint".to_string(),
-            )]),
-            mounts: Vec::new(),
-            device_specs: Vec::new(),
-        };
-
-        let (mut dps, receivers) = create_device_plugin_service_common(
-            DevicePluginKind::Instance,
-            path_to_config,
-            instance_id,
-            &device,
-            connectivity_status,
-            add_to_instance_map,
-        );
-        let device_plugin_behavior = Arc::new(InstanceDevicePlugin {
-            instance_id: instance_id.to_string(),
-            shared: false,
-            device,
-        });
-        dps.device_plugin_behavior = device_plugin_behavior.clone();
-        (dps, device_plugin_behavior, receivers)
-    }
-
-    fn create_device_plugin_service_common(
-        device_plugin_kind: DevicePluginKind,
-        path_to_config: &str,
-        instance_id: &str,
-        device: &Device,
+        device_plugin_kind: DevicePluginKindTest,
         connectivity_status: InstanceConnectivityStatus,
         add_to_instance_map: bool,
     ) -> (DevicePluginService, DevicePluginServiceReceivers) {
+        let path_to_config = "../test/yaml/config-a.yaml";
+        let instance_id = "b494b6";
         let kube_akri_config_yaml =
             fs::read_to_string(path_to_config).expect("Unable to read file");
         let kube_akri_config: Configuration = serde_yaml::from_str(&kube_akri_config_yaml).unwrap();
@@ -1603,9 +1544,32 @@ mod device_plugin_service_tests {
             usage_update_message_sender: Some(configuration_list_and_watch_message_sender.clone()),
             instances,
         }));
-        let list_and_watch_message_sender = match device_plugin_kind {
-            DevicePluginKind::Configuration => configuration_list_and_watch_message_sender,
-            DevicePluginKind::Instance => instance_list_and_watch_message_sender,
+        let device = Device {
+            id: "n/a".to_string(),
+            properties: HashMap::from([(
+                "DEVICE_LOCATION_INFO".to_string(),
+                "endpoint".to_string(),
+            )]),
+            mounts: Vec::new(),
+            device_specs: Vec::new(),
+        };
+
+        let list_and_watch_message_sender;
+        let device_plugin_behavior;
+        match device_plugin_kind {
+            DevicePluginKindTest::Configuration => {
+                list_and_watch_message_sender = configuration_list_and_watch_message_sender;
+                device_plugin_behavior = DevicePluginKind::Instance(InstanceDevicePlugin {
+                    instance_id: instance_id.to_string(),
+                    shared: false,
+                    device,
+                });
+            }
+            DevicePluginKindTest::Instance => {
+                list_and_watch_message_sender = instance_list_and_watch_message_sender;
+                device_plugin_behavior =
+                    DevicePluginKind::Configuration(ConfigurationDevicePlugin {});
+            }
         };
         let dps = DevicePluginService {
             instance_name: device_instance_name,
@@ -1617,7 +1581,7 @@ mod device_plugin_service_tests {
             instance_map,
             list_and_watch_message_sender,
             server_ender_sender,
-            device_plugin_behavior: Arc::new(MockDevicePluginServiceBehavior::new()),
+            device_plugin_behavior: device_plugin_behavior,
         };
         (
             dps,
@@ -1726,7 +1690,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_try_create_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let mut mock = MockKubeInterface::new();
         configure_find_configuration(
@@ -1757,24 +1721,28 @@ mod device_plugin_service_tests {
             .returning(move |_, _, _, _, _| Ok(()));
 
         let dps = Arc::new(device_plugin_service);
-        assert!(
-            try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+        if let DevicePluginKind::Instance(instance_device_plugin) = dps.device_plugin_behavior {
+            assert!(
+                try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+                    .await
+                    .is_ok()
+            );
+            assert!(dps
+                .instance_map
+                .read()
                 .await
-                .is_ok()
-        );
-        assert!(dps
-            .instance_map
-            .read()
-            .await
-            .instances
-            .contains_key(&dps.instance_name));
+                .instances
+                .contains_key(&dps.instance_name));
+        } else {
+            assert!(false, "Incorrect device plugin kind configured");
+        }
     }
 
     // Tests that try_create_instance updates already existing instance with this node
     #[tokio::test]
     async fn test_try_create_instance_already_created() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let mut mock = MockKubeInterface::new();
         configure_find_configuration(
@@ -1803,17 +1771,21 @@ mod device_plugin_service_tests {
             .returning(move |_, _, _| Ok(()));
 
         let dps = Arc::new(device_plugin_service);
-        assert!(
-            try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+        if let DevicePluginKind::Instance(instance_device_plugin) = dps.device_plugin_behavior {
+            assert!(
+                try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+                    .await
+                    .is_ok()
+            );
+            assert!(dps
+                .instance_map
+                .read()
                 .await
-                .is_ok()
-        );
-        assert!(dps
-            .instance_map
-            .read()
-            .await
-            .instances
-            .contains_key(&dps.instance_name));
+                .instances
+                .contains_key(&dps.instance_name));
+        } else {
+            assert!(false, "Incorrect device plugin kind configured");
+        }
     }
 
     // Test when instance already created and already contains this node.
@@ -1821,7 +1793,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_try_create_instance_already_created_no_update() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let mut mock = MockKubeInterface::new();
         configure_find_configuration(
@@ -1839,24 +1811,28 @@ mod device_plugin_service_tests {
             1,
         );
         let dps = Arc::new(device_plugin_service);
-        assert!(
-            try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+        if let DevicePluginKind::Instance(instance_device_plugin) = dps.device_plugin_behavior {
+            assert!(
+                try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+                    .await
+                    .is_ok()
+            );
+            assert!(dps
+                .instance_map
+                .read()
                 .await
-                .is_ok()
-        );
-        assert!(dps
-            .instance_map
-            .read()
-            .await
-            .instances
-            .contains_key(&dps.instance_name));
+                .instances
+                .contains_key(&dps.instance_name));
+        } else {
+            assert!(false, "Incorrect device plugin kind configured");
+        }
     }
 
     // Tests that try_create_instance returns error when trying to create an Instance for a Config that DNE
     #[tokio::test]
     async fn test_try_create_instance_no_config() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let config_name = device_plugin_service.config_name.clone();
         let config_namespace = device_plugin_service.config_namespace.clone();
@@ -1870,20 +1846,23 @@ mod device_plugin_service_tests {
                 let error = Error::new(ErrorKind::InvalidInput, "Configuration doesn't exist");
                 Err(error.into())
             });
-        assert!(try_create_instance(
-            Arc::new(device_plugin_service),
-            &instance_device_plugin,
-            Arc::new(mock)
-        )
-        .await
-        .is_err());
+        let dps = Arc::new(device_plugin_service);
+        if let DevicePluginKind::Instance(instance_device_plugin) = dps.device_plugin_behavior {
+            assert!(
+                try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(false, "Incorrect device plugin kind configured");
+        }
     }
 
     // Tests that try_create_instance error
     #[tokio::test]
     async fn test_try_create_instance_error() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let mut mock = MockKubeInterface::new();
         configure_find_configuration(
@@ -1915,24 +1894,28 @@ mod device_plugin_service_tests {
             .returning(move |_, _, _, _, _| Err(anyhow::anyhow!("failure")));
 
         let dps = Arc::new(device_plugin_service);
-        assert!(
-            try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+        if let DevicePluginKind::Instance(instance_device_plugin) = dps.device_plugin_behavior {
+            assert!(
+                try_create_instance(dps.clone(), &instance_device_plugin, Arc::new(mock))
+                    .await
+                    .is_err()
+            );
+            assert!(!dps
+                .instance_map
+                .read()
                 .await
-                .is_err()
-        );
-        assert!(!dps
-            .instance_map
-            .read()
-            .await
-            .instances
-            .contains_key(&dps.instance_name));
+                .instances
+                .contains_key(&dps.instance_name));
+        } else {
+            assert!(false, "Incorrect device plugin kind configured");
+        }
     }
 
     // Tests list_and_watch by creating DevicePluginService and DevicePlugin client (emulating kubelet)
     #[tokio::test]
     async fn test_internal_list_and_watch() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, false);
         let list_and_watch_message_sender =
             device_plugin_service.list_and_watch_message_sender.clone();
@@ -2205,7 +2188,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_build_list_and_watch_response_offline() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Offline(Instant::now()), true);
         let instance_name = device_plugin_service.instance_name.clone();
         let mock = MockKubeInterface::new();
@@ -2229,7 +2212,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_build_list_and_watch_response_no_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let instance_name = device_plugin_service.instance_name.clone();
         let instance_name_clone = instance_name.clone();
@@ -2261,7 +2244,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_build_list_and_watch_response_no_instance_update() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let instance_name = device_plugin_service.instance_name.clone();
         let instance_namespace = device_plugin_service.config_namespace.clone();
@@ -2327,7 +2310,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_internal_allocate_env_vars() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, mut device_plugin_service_receivers) =
+        let (device_plugin_service, mut device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let node_name = device_plugin_service.node_name.clone();
         let mut mock = MockKubeInterface::new();
@@ -2372,7 +2355,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_internal_allocate_success() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, mut device_plugin_service_receivers) =
+        let (device_plugin_service, mut device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let node_name = device_plugin_service.node_name.clone();
         let mut mock = MockKubeInterface::new();
@@ -2406,7 +2389,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_internal_allocate_deallocate() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, mut device_plugin_service_receivers) =
+        let (device_plugin_service, mut device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let mut mock = MockKubeInterface::new();
         let request = setup_internal_allocate_tests(
@@ -2438,7 +2421,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_internal_allocate_taken() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, mut device_plugin_service_receivers) =
+        let (device_plugin_service, mut device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let device_usage_id_slot = format!("{}-0", device_plugin_service.instance_name);
         let mut mock = MockKubeInterface::new();
@@ -2482,7 +2465,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_internal_allocate_no_id() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _instance_device_plugin, mut device_plugin_service_receivers) =
+        let (device_plugin_service, mut device_plugin_service_receivers) =
             create_device_plugin_service(InstanceConnectivityStatus::Online, true);
         let device_usage_id_slot = format!("{}-100", device_plugin_service.instance_name);
         let mut mock = MockKubeInterface::new();
@@ -2525,11 +2508,7 @@ mod device_plugin_service_tests {
         connectivity_status: InstanceConnectivityStatus,
         add_to_instance_map: bool,
         unique_devices: bool,
-    ) -> (
-        DevicePluginService,
-        Arc<ConfigurationDevicePlugin>,
-        DevicePluginServiceReceivers,
-    ) {
+    ) -> (DevicePluginService, DevicePluginServiceReceivers) {
         let path_to_config = "../test/yaml/config-a.yaml";
         let instance_id = "b494b6";
         let device = Device {
@@ -2542,26 +2521,25 @@ mod device_plugin_service_tests {
             device_specs: Vec::new(),
         };
 
+        let device_plugin_behavior = DevicePluginKind::Configuration(ConfigurationDevicePlugin {});
         let (mut dps, receivers) = create_device_plugin_service_common(
-            DevicePluginKind::Configuration,
+            device_plugin_behavior,
             path_to_config,
             instance_id,
             &device,
             connectivity_status,
             add_to_instance_map,
         );
-        let device_plugin_behavior = Arc::new(ConfigurationDevicePlugin {});
-        dps.device_plugin_behavior = device_plugin_behavior.clone();
         dps.config.unique_devices = unique_devices;
 
-        (dps, device_plugin_behavior, receivers)
+        (dps, receivers)
     }
 
     // configuration resource from instance, no instance available, should receive nothing from the response stream
     #[tokio::test]
     async fn test_cdps_from_instance_internal_list_and_watch_no_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_configuration_device_plugin_service(
                 InstanceConnectivityStatus::Online,
                 false,
@@ -2586,7 +2564,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_cdps_from_device_usage_list_and_watch_no_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_configuration_device_plugin_service(
                 InstanceConnectivityStatus::Online,
                 false,
@@ -2611,7 +2589,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_cdps_from_instance_list_and_watch_with_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_configuration_device_plugin_service(
                 InstanceConnectivityStatus::Online,
                 true,
@@ -2658,7 +2636,7 @@ mod device_plugin_service_tests {
     #[tokio::test]
     async fn test_cdps_from_device_usage_list_and_watch_with_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
-        let (device_plugin_service, _configuration_device_plugin, _device_plugin_service_receivers) =
+        let (device_plugin_service, _device_plugin_service_receivers) =
             create_configuration_device_plugin_service(
                 InstanceConnectivityStatus::Online,
                 true,
@@ -2760,15 +2738,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_allocate_env_vars() {
         let _ = env_logger::builder().is_test(true).try_init();
         let uinque_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            uinque_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                uinque_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -2837,15 +2812,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_allocate_env_vars() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -2914,15 +2886,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_allocate_success() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -2980,15 +2949,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_allocate_success() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -3048,15 +3014,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_reallocate() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -3106,15 +3069,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_reallocate() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -3162,15 +3122,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_allocate_taken_by_other_node() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let instance_name = device_plugin_service
             .instance_map
             .read()
@@ -3210,15 +3167,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_allocate_taken_by_other_node() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let instance_name = device_plugin_service
             .instance_map
             .read()
@@ -3258,15 +3212,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_allocate_taken_by_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices.clone(),
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices.clone(),
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -3307,15 +3258,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_allocate_taken_by_instance() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let node_name = device_plugin_service.node_name.clone();
         let instance_name = device_plugin_service
             .instance_map
@@ -3355,15 +3303,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_instance_internal_allocate_no_id() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = true;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let mut mock = MockKubeInterface::new();
         let request = setup_configuration_internal_allocate_tests(
             &mut mock,
@@ -3398,15 +3343,12 @@ mod device_plugin_service_tests {
     async fn test_cdps_from_device_usage_internal_allocate_no_id() {
         let _ = env_logger::builder().is_test(true).try_init();
         let unique_devices = false;
-        let (
-            device_plugin_service,
-            _configuration_device_plugin,
-            mut device_plugin_service_receivers,
-        ) = create_configuration_device_plugin_service(
-            InstanceConnectivityStatus::Online,
-            true,
-            unique_devices,
-        );
+        let (device_plugin_service, mut device_plugin_service_receivers) =
+            create_configuration_device_plugin_service(
+                InstanceConnectivityStatus::Online,
+                true,
+                unique_devices,
+            );
         let mut mock = MockKubeInterface::new();
         let request = setup_configuration_internal_allocate_tests(
             &mut mock,
