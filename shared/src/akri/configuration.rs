@@ -44,13 +44,6 @@ pub enum BrokerSpec {
     BrokerJobSpec(Box<JobSpec>),
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum ConfigurationResourceFrom {
-    Instance,
-    DeviceUsage,
-}
-
 /// Defines the information in the Akri Configuration CRD
 ///
 /// A Configuration is the primary method for users to describe anticipated
@@ -72,10 +65,10 @@ pub struct ConfigurationSpec {
     pub capacity: i32,
 
     /// This defines the type that the Configuration Resource is based on
-    /// instance: expose one virtual device for each instance
-    /// deviceUsage: expose ConfigurationSpec.capacity virtual devices for each instance
-    #[serde(default = "default_configuration_resource_type")]
-    pub configuration_resource_from: ConfigurationResourceFrom,
+    /// true: expose one virtual device for each instance
+    /// false: expose ConfigurationSpec.capacity virtual devices for each instance
+    #[serde(default = "default_unique_devices")]
+    pub unique_devices: bool,
 
     /// This defines a workload that should be scheduled to any
     /// node that can access any capability described by this
@@ -196,8 +189,8 @@ fn default_capacity() -> i32 {
     1
 }
 
-fn default_configuration_resource_type() -> ConfigurationResourceFrom {
-    ConfigurationResourceFrom::Instance
+fn default_unique_devices() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -230,7 +223,7 @@ mod crd_serialization_tests {
         let json = r#"{"discoveryHandler":{"name":"onvif", "discoveryDetails":"{\"onvif\":{}}"}}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
         assert_eq!(default_capacity(), deserialized.capacity);
-        assert_eq!(default_configuration_resource_type(), deserialized.configuration_resource_from);
+        assert_eq!(default_unique_devices(), deserialized.unique_devices);
         assert_eq!(None, deserialized.broker_spec);
         assert_eq!(None, deserialized.instance_service_spec);
         assert_eq!(None, deserialized.configuration_service_spec);
@@ -238,28 +231,28 @@ mod crd_serialization_tests {
     }
 
     #[test]
-    fn test_config_serialization_configuration_resource_from() {
+    fn test_config_serialization_unique_devices() {
         let _ = env_logger::builder().is_test(true).try_init();
 
-        // configuration_resource_from should be default if not specified
+        // unique_devices should be default if not specified
         let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""}}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(default_configuration_resource_type(), deserialized.configuration_resource_from);
+        assert_eq!(default_unique_devices(), deserialized.unique_devices);
 
-        // configuration_resource_from should be Instance if specified
-        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"configurationResourceFrom":"instance"}"#;
+        // unique_devices should be true if specified
+        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":true}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(ConfigurationResourceFrom::Instance, deserialized.configuration_resource_from);
+        assert_eq!(true, deserialized.unique_devices);
 
-        // configuration_resource_from should be DeviceUsage if specified
-        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"configurationResourceFrom":"deviceUsage"}"#;
+        // unique_devices should be false if specified
+        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":false}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(ConfigurationResourceFrom::DeviceUsage, deserialized.configuration_resource_from);
+        assert_eq!(false, deserialized.unique_devices);
 
-        // deserialization should fail if configurationResourceFrom is not in the ConfigurationResourceFrom enum
-        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"configurationResourceFrom":"others"}"#;
+        // deserialization should fail if unique_devices is not bool
+        let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":0}"#;
         if serde_json::from_str::<ConfigurationSpec>(json).is_ok() {
-            panic!("value of configurationResourceFrom can only be enum ConfigurationResourceFrom");
+            panic!("value of uniqueDevices can only be bool");
         }
     }
 
@@ -271,6 +264,7 @@ mod crd_serialization_tests {
         let json = r#"{"discoveryHandler":{"name":"random", "discoveryDetails":""}, "brokerSpec":{"brokerPodSpec":{"containers": [{"image": "nginx:latest","name": "broker"}]}}, "capacity":4}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
         assert_eq!(4, deserialized.capacity);
+        assert_eq!(default_unique_devices(), deserialized.unique_devices);
         assert_eq!(None, deserialized.instance_service_spec);
         assert_eq!(None, deserialized.configuration_service_spec);
         assert_eq!(0, deserialized.broker_properties.len());
@@ -280,7 +274,7 @@ mod crd_serialization_tests {
             panic!("Expected BrokerPodSpec");
         }
         let serialized = serde_json::to_string(&deserialized).unwrap();
-        let expected_deserialized = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"capacity":4,"configurationResourceFrom":"instance","brokerSpec":{"brokerPodSpec":{"containers":[{"image":"nginx:latest","name":"broker"}]}},"brokerProperties":{}}"#;
+        let expected_deserialized = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"capacity":4,"uniqueDevices":true,"brokerSpec":{"brokerPodSpec":{"containers":[{"image":"nginx:latest","name":"broker"}]}},"brokerProperties":{}}"#;
         assert_eq!(expected_deserialized, serialized);
     }
 
@@ -292,6 +286,7 @@ mod crd_serialization_tests {
         let json = r#"{"discoveryHandler":{"name":"random", "discoveryDetails":""}, "brokerSpec":{"brokerJobSpec":{"template": {"spec": {"containers": [{"image": "nginx:latest","name": "broker"}], "restartPolicy": "OnFailure"}}}}, "capacity":4}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
         assert_eq!(4, deserialized.capacity);
+        assert_eq!(default_unique_devices(), deserialized.unique_devices);
         assert_eq!(None, deserialized.instance_service_spec);
         assert_eq!(None, deserialized.configuration_service_spec);
         assert_eq!(0, deserialized.broker_properties.len());
@@ -301,7 +296,7 @@ mod crd_serialization_tests {
             panic!("Expected BrokerJobSpec");
         }
         let serialized = serde_json::to_string(&deserialized).unwrap();
-        let expected_deserialized = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"capacity":4,"configurationResourceFrom":"instance","brokerSpec":{"brokerJobSpec":{"template":{"spec":{"containers":[{"image":"nginx:latest","name":"broker"}],"restartPolicy":"OnFailure"}}}},"brokerProperties":{}}"#;
+        let expected_deserialized = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"capacity":4,"uniqueDevices":true,"brokerSpec":{"brokerJobSpec":{"template":{"spec":{"containers":[{"image":"nginx:latest","name":"broker"}],"restartPolicy":"OnFailure"}}}},"brokerProperties":{}}"#;
         assert_eq!(expected_deserialized, serialized);
     }
 
@@ -363,6 +358,7 @@ mod crd_serialization_tests {
                     }
                 },
                 "capacity": 5,
+                "uniqueDevices": false,
                 "configurationServiceSpec": {
                     "ports": [
                         {
@@ -388,6 +384,7 @@ mod crd_serialization_tests {
         assert_eq!(deserialized.discovery_handler.name, "random".to_string());
         assert!(deserialized.discovery_handler.discovery_details.is_empty());
         assert_eq!(5, deserialized.capacity);
+        assert_eq!(false, deserialized.unique_devices);
         if let BrokerSpec::BrokerJobSpec(_j) = deserialized.broker_spec.unwrap() {
             panic!("Expected BrokerPodSpec");
         }
