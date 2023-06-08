@@ -242,12 +242,12 @@ mod crd_serialization_tests {
         // unique_devices should be true if specified
         let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":true}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(true, deserialized.unique_devices);
+        assert!(deserialized.unique_devices);
 
         // unique_devices should be false if specified
         let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":false}"#;
         let deserialized: ConfigurationSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(false, deserialized.unique_devices);
+        assert!(!deserialized.unique_devices);
 
         // deserialization should fail if unique_devices is not bool
         let json = r#"{"discoveryHandler":{"name":"random","discoveryDetails":""},"uniqueDevices":0}"#;
@@ -384,7 +384,7 @@ mod crd_serialization_tests {
         assert_eq!(deserialized.discovery_handler.name, "random".to_string());
         assert!(deserialized.discovery_handler.discovery_details.is_empty());
         assert_eq!(5, deserialized.capacity);
-        assert_eq!(false, deserialized.unique_devices);
+        assert!(!deserialized.unique_devices);
         if let BrokerSpec::BrokerJobSpec(_j) = deserialized.broker_spec.unwrap() {
             panic!("Expected BrokerPodSpec");
         }
