@@ -840,7 +840,7 @@ async fn get_usage_slot_allocation_info(
     _capacity: i32,
     _allocated_instances: &HashMap<String, HashSet<String>>,
     _instance_map: InstanceMap,
-    _kube_interface: Arc<impl KubeInterface + ?Sized>,
+    _kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(String, String), Status> {
     let instance_name: String = match device_id.rfind('-') {
         Some(pos) => device_id.chars().take(pos).collect(),
@@ -877,7 +877,7 @@ async fn get_instance_allocation_info(
     capacity: i32,
     allocated_instances: &HashMap<String, HashSet<String>>,
     instance_map: InstanceMap,
-    kube_interface: Arc<impl KubeInterface + ?Sized>,
+    kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(String, String), Status> {
     let instance_name = device_id;
 
@@ -936,7 +936,7 @@ async fn get_instance_allocation_info(
 async fn find_free_instance_device_usage_slot(
     instance_name: &str,
     instance_namespace: &str,
-    kube_interface: Arc<impl KubeInterface + ?Sized>,
+    kube_interface: Arc<impl KubeInterface>,
 ) -> Result<Option<String>, Status> {
     let instance_spec = match kube_interface
         .find_instance(instance_name, instance_namespace)
@@ -1020,7 +1020,7 @@ async fn try_update_instance_device_usage(
     instance_name: &str,
     instance_namespace: &str,
     allow_duplicate_reserve: bool,
-    kube_interface: Arc<impl KubeInterface + ?Sized>,
+    kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(), Status> {
     let mut instance: InstanceSpec;
     for x in 0..MAX_INSTANCE_UPDATE_TRIES {
@@ -1125,7 +1125,7 @@ fn build_container_allocate_response(
 async fn try_create_instance(
     dps: Arc<DevicePluginService>,
     instance_dp: &InstanceDevicePlugin,
-    kube_interface: Arc<impl KubeInterface + ?Sized>,
+    kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(), anyhow::Error> {
     // Make sure Configuration exists for instance
     if let Err(e) = kube_interface
@@ -1246,7 +1246,7 @@ async fn try_create_instance(
 async fn build_list_and_watch_response<F>(
     instance_name: &str,
     dps: Arc<DevicePluginService>,
-    kube_interface: Arc<impl KubeInterface + ?Sized>,
+    kube_interface: Arc<impl KubeInterface>,
     reallocate_predicate: F,
 ) -> Result<Vec<v1beta1::Device>, Box<dyn std::error::Error + Send + Sync + 'static>>
 where
