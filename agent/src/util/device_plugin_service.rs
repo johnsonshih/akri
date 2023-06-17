@@ -290,8 +290,7 @@ impl InstanceDevicePlugin {
                     !configuration_usage_slots.contains(device_usage_id)
                 },
             )
-            .await
-            .unwrap();
+            .await;
             // Only send the virtual devices if the list has changed
             if !(prev_virtual_devices
                 .iter()
@@ -536,8 +535,7 @@ impl ConfigurationDevicePlugin {
                         configuration_usage_slots.contains(device_usage_id)
                     },
                 )
-                .await
-                .unwrap();
+                .await;
                 discovered_devices.insert(instance_name, virtual_devices);
             }
             // Construct virtual device info list
@@ -1194,7 +1192,7 @@ async fn build_list_and_watch_response<F>(
     dps: Arc<DevicePluginService>,
     kube_interface: Arc<impl KubeInterface>,
     reallocate_predicate: F,
-) -> Result<Vec<v1beta1::Device>, Box<dyn std::error::Error + Send + Sync + 'static>>
+) -> Vec<v1beta1::Device>
 where
     F: Fn(&str, &HashSet<String>) -> bool,
 {
@@ -1203,36 +1201,25 @@ where
         instance_name
     );
 
-    // If instance has been removed from map, send back all unhealthy device slots
-    if !dps
-        .instance_map
-        .read()
-        .await
-        .instances
-        .contains_key(instance_name)
     {
-        trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
-        return Ok(build_unhealthy_virtual_devices(
-            dps.config.capacity,
-            instance_name,
-        ));
-    }
-    // If instance is offline, send back all unhealthy device slots
-    if dps
-        .instance_map
-        .read()
-        .await
-        .instances
-        .get(instance_name)
-        .unwrap()
-        .connectivity_status
-        != InstanceConnectivityStatus::Online
-    {
-        trace!("build_list_and_watch_response - device for Instance {} is offline ... returning unhealthy devices", instance_name);
-        return Ok(build_unhealthy_virtual_devices(
-            dps.config.capacity,
-            instance_name,
-        ));
+        let instance_map = dps.instance_map.read().await;
+
+        // If instance has been removed from map, send back all unhealthy device slots
+        if !instance_map.instances.contains_key(instance_name) {
+            trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
+            return build_unhealthy_virtual_devices(dps.config.capacity, instance_name);
+        }
+        // If instance is offline, send back all unhealthy device slots
+        if instance_map
+            .instances
+            .get(instance_name)
+            .unwrap()
+            .connectivity_status
+            != InstanceConnectivityStatus::Online
+        {
+            trace!("build_list_and_watch_response - device for Instance {} is offline ... returning unhealthy devices", instance_name);
+            return build_unhealthy_virtual_devices(dps.config.capacity, instance_name);
+        }
     }
 
     trace!(
@@ -1246,6 +1233,11 @@ where
     {
         Ok(kube_akri_instance) => {
             let mut instance_map_guard = dps.instance_map.write().await;
+            // recheck if the instance still exists
+            if !instance_map_guard.instances.contains_key(instance_name) {
+                trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
+                return build_unhealthy_virtual_devices(dps.config.capacity, instance_name);
+            }
             let instance_info = instance_map_guard.instances.get(instance_name).unwrap();
             let (devices, updated_usage_slots) = build_virtual_devices(
                 &kube_akri_instance.spec.device_usage,
@@ -1266,14 +1258,11 @@ where
                     instance_info.configuration_usage_slots = updated_usage_slots;
                 });
 
-            Ok(devices)
+            devices
         }
         Err(_) => {
             trace!("build_list_and_watch_response - could not find instance {} so returning unhealthy devices", instance_name);
-            Ok(build_unhealthy_virtual_devices(
-                dps.config.capacity,
-                instance_name,
-            ))
+            build_unhealthy_virtual_devices(dps.config.capacity, instance_name)
         }
     }
 }
@@ -2175,8 +2164,7 @@ mod device_plugin_service_tests {
                 !configuration_usage_slots.contains(device_usage_id)
             },
         )
-        .await
-        .unwrap();
+        .await;
         devices
             .into_iter()
             .for_each(|device| assert!(device.health == UNHEALTHY));
@@ -2211,8 +2199,7 @@ mod device_plugin_service_tests {
                 !configuration_usage_slots.contains(device_usage_id)
             },
         )
-        .await
-        .unwrap();
+        .await;
         devices
             .into_iter()
             .for_each(|device| assert!(device.health == UNHEALTHY));
@@ -2249,8 +2236,7 @@ mod device_plugin_service_tests {
                 !configuration_usage_slots.contains(device_usage_id)
             },
         )
-        .await
-        .unwrap();
+        .await;
         check_devices(instance_name, devices);
     }
 
