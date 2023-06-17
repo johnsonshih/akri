@@ -1498,22 +1498,19 @@ mod device_plugin_service_tests {
             instances,
         }));
 
-        let list_and_watch_message_sender;
-        let device_plugin_behavior;
-        match device_plugin_kind {
-            DevicePluginKind::Instance => {
-                list_and_watch_message_sender = instance_list_and_watch_message_sender;
-                device_plugin_behavior = DevicePluginBehavior::Instance(InstanceDevicePlugin {
+        let (list_and_watch_message_sender, device_plugin_behavior) = match device_plugin_kind {
+            DevicePluginKind::Instance => (
+                instance_list_and_watch_message_sender,
+                DevicePluginBehavior::Instance(InstanceDevicePlugin {
                     instance_id: instance_id.to_string(),
                     shared: false,
                     device,
-                });
-            }
-            DevicePluginKind::Configuration => {
-                list_and_watch_message_sender = configuration_list_and_watch_message_sender;
-                device_plugin_behavior =
-                    DevicePluginBehavior::Configuration(ConfigurationDevicePlugin {});
-            }
+                }),
+            ),
+            DevicePluginKind::Configuration => (
+                configuration_list_and_watch_message_sender,
+                DevicePluginBehavior::Configuration(ConfigurationDevicePlugin {}),
+            ),
         };
         let dps = DevicePluginService {
             instance_name: device_instance_name,
