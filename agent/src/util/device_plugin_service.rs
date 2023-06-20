@@ -1216,33 +1216,20 @@ async fn build_list_and_watch_response(
         .await
     {
         Ok(kube_akri_instance) => {
-            let mut instance_map_guard = dps.instance_map.write().await;
+            let instance_map = dps.instance_map.read().await;
             // recheck if the instance still exists
-            if !instance_map_guard.instances.contains_key(instance_name) {
+            if !instance_map.instances.contains_key(instance_name) {
                 trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
                 return build_unhealthy_virtual_devices(dps.config.capacity, instance_name);
             }
-            let instance_info = instance_map_guard.instances.get(instance_name).unwrap();
-            let (devices, updated_usage_slots) = build_virtual_devices(
+            let instance_info = instance_map.instances.get(instance_name).unwrap();
+            build_virtual_devices(
                 &kube_akri_instance.spec.device_usage,
                 kube_akri_instance.spec.shared,
                 &dps.node_name,
                 &instance_info.configuration_usage_slots,
                 for_configuration,
-            );
-            // Update cl_usage_slot based on new instance information
-            trace!(
-                "build_list_and_watch_response - updated configuration usage slots {:?}",
-                updated_usage_slots
-            );
-            instance_map_guard
-                .instances
-                .entry(instance_name.to_string())
-                .and_modify(|instance_info| {
-                    instance_info.configuration_usage_slots = updated_usage_slots;
-                });
-
-            devices
+            )
         }
         Err(_) => {
             trace!("build_list_and_watch_response - could not find instance {} so returning unhealthy devices", instance_name);
@@ -1278,9 +1265,8 @@ fn build_virtual_devices(
     node_name: &str,
     configuration_usage_slots: &HashSet<String>,
     for_configuration: bool,
-) -> (Vec<v1beta1::Device>, HashSet<String>) {
+) -> Vec<v1beta1::Device> {
     let mut devices: Vec<v1beta1::Device> = Vec::new();
-    let mut current_usage_slots = configuration_usage_slots.clone();
     for (device_name, allocated_node) in device_usage {
         let healthy = if !allocated_node.is_empty() && allocated_node != node_name {
             // Throw error if unshared resource is reserved by another node
@@ -1293,10 +1279,6 @@ fn build_virtual_devices(
                 || for_configuration == configuration_usage_slots.contains(device_name)
         };
 
-        // Remove the device from the current usage slot if it is not reserved by any node
-        if healthy && allocated_node.is_empty() {
-            current_usage_slots.remove(device_name);
-        }
         let health = if healthy { HEALTHY } else { UNHEALTHY };
         trace!(
             "build_virtual_devices - [shared = {}] device with name [{}] and health: [{}]",
@@ -1309,7 +1291,7 @@ fn build_virtual_devices(
             health: health.to_string(),
         });
     }
-    (devices, current_usage_slots)
+    devices
 }
 
 /// This sends message to end `list_and_watch` and removes instance from InstanceMap.
@@ -1928,7 +1910,7 @@ mod device_plugin_service_tests {
 
         // Test shared all healthy
         let slots_used_by_configuration = HashSet::new();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             true,
             "nodeA",
@@ -1941,11 +1923,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test unshared all healthy
         let slots_used_by_configuration = HashSet::new();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             false,
             "nodeA",
@@ -1958,11 +1939,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test shared some unhealthy (taken by another node)
         let slots_used_by_configuration = HashSet::new();
-        let (devices, _) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             true,
             "nodeB",
@@ -1975,11 +1955,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test shared some unhealthy instance virtual devices (taken by configuration device plugin)
         let slots_used_by_configuration = allocated_usage_slots.clone();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             true,
             "nodeA",
@@ -1992,11 +1971,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test unshared some unhealthy instance virtual devices (taken by configuration device plugin)
         let slots_used_by_configuration = allocated_usage_slots.clone();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             false,
             "nodeA",
@@ -2009,7 +1987,6 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test unshared panic. A different node should never be listed under any device usage slots
         let result = std::panic::catch_unwind(|| {
@@ -2019,7 +1996,7 @@ mod device_plugin_service_tests {
 
         // Test shared all healthy, Configuration virtual devices
         let slots_used_by_configuration = allocated_usage_slots.clone();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             true,
             "nodeA",
@@ -2032,11 +2009,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test unshared all healthy, Configuration virtual devices
         let slots_used_by_configuration = allocated_usage_slots.clone();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             false,
             "nodeA",
@@ -2049,11 +2025,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test shared some unhealthy configuration virtual devices (taken by instance device plugin)
         let slots_used_by_configuration = HashSet::new();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             true,
             "nodeA",
@@ -2068,11 +2043,10 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
 
         // Test unshared some unhealthy configuration virtual devices (taken by instance device plugin)
         let slots_used_by_configuration = HashSet::new();
-        let (devices, updated_usage_slots) = build_virtual_devices(
+        let devices = build_virtual_devices(
             &device_usage,
             false,
             "nodeA",
@@ -2087,25 +2061,6 @@ mod device_plugin_service_tests {
                 &device.health
             );
         }
-        assert_eq!(updated_usage_slots, slots_used_by_configuration);
-
-        // Test when the device usage map is updated by DevicePluginSlotReconciler
-        // the build_virtual_devices return updated usage slots reflect the correct device usage
-        let slots_used_by_configuration = allocated_usage_slots.clone();
-        let (devices, updated_usage_slots) = build_virtual_devices(
-            &device_usage_all_free,
-            true,
-            "nodeA",
-            &slots_used_by_configuration,
-            true,
-        );
-        for device in devices {
-            assert_eq!(
-                expected_devices_nodea.get(&device.id).unwrap(),
-                &device.health
-            );
-        }
-        assert!(updated_usage_slots.is_empty());
     }
 
     // Tests when InstanceConnectivityStatus is offline and unhealthy devices are returned
