@@ -969,6 +969,37 @@ async fn try_update_instance_device_usage(
                 }
                 random_delay().await;
             } else {
+                if !for_configuration {
+                    // slot reserved by Instance, remove the slot from configuration_usage_slots
+                    let mut instance_map_guard = instance_map.write().await;
+                    if !instance_map_guard.instances.contains_key(instance_name) {
+                        trace!(
+                            "try_update_instance_device_usage - Instance {} not found in instance map",
+                            instance_name
+                        );
+                        return Err(Status::new(
+                            Code::Unknown,
+                            format!(
+                                "Could not find Instance {} from instance map",
+                                instance_name
+                            ),
+                        ));
+                    }
+                    trace!(
+                        "Remove {} from configuration_usage_slots of Instance {}",
+                        device_usage_id,
+                        instance_name
+                    );
+
+                    instance_map_guard
+                        .instances
+                        .entry(instance_name.to_string())
+                        .and_modify(|instance_info| {
+                            instance_info
+                                .configuration_usage_slots
+                                .remove(device_usage_id);
+                        });
+                }
                 return Ok(());
             }
         } else {
