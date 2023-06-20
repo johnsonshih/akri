@@ -285,10 +285,7 @@ impl InstanceDevicePlugin {
                 &dps.instance_name,
                 dps.clone(),
                 kube_interface.clone(),
-                |device_usage_id, configuration_usage_slots| {
-                    // Allow reallocate if not reserved by Configuration
-                    !configuration_usage_slots.contains(device_usage_id)
-                },
+                false,
             )
             .await;
             // Only send the virtual devices if the list has changed
@@ -530,10 +527,7 @@ impl ConfigurationDevicePlugin {
                     &instance_name,
                     dps.clone(),
                     kube_interface.clone(),
-                    |device_usage_id, configuration_usage_slots| {
-                        // Allow reallocate if reserved by Configuration
-                        configuration_usage_slots.contains(device_usage_id)
-                    },
+                    true,
                 )
                 .await;
                 discovered_devices.insert(instance_name, virtual_devices);
@@ -1187,15 +1181,12 @@ async fn try_create_instance(
 
 /// Returns list of "virtual" Devices and their health.
 /// If the instance is offline, returns all unhealthy virtual Devices.
-async fn build_list_and_watch_response<F>(
+async fn build_list_and_watch_response(
     instance_name: &str,
     dps: Arc<DevicePluginService>,
     kube_interface: Arc<impl KubeInterface>,
-    reallocate_predicate: F,
-) -> Vec<v1beta1::Device>
-where
-    F: Fn(&str, &HashSet<String>) -> bool,
-{
+    for_configuration: bool,
+) -> Vec<v1beta1::Device> {
     info!(
         "build_list_and_watch_response -- for Instance {} entered",
         instance_name
@@ -1244,7 +1235,7 @@ where
                 kube_akri_instance.spec.shared,
                 &dps.node_name,
                 &instance_info.configuration_usage_slots,
-                reallocate_predicate,
+                for_configuration,
             );
             // Update cl_usage_slot based on new instance information
             trace!(
@@ -1288,16 +1279,13 @@ fn build_unhealthy_virtual_devices(capacity: i32, instance_name: &str) -> Vec<v1
 
 /// This builds a list of virtual Devices, determining the health of each virtual Device as follows:
 /// Healthy if it is available to be used by this node or Unhealthy if it is already taken by another node.
-fn build_virtual_devices<F>(
+fn build_virtual_devices(
     device_usage: &HashMap<String, String>,
     shared: bool,
     node_name: &str,
     configuration_usage_slots: &HashSet<String>,
-    reallocate_predicate: F,
-) -> (Vec<v1beta1::Device>, HashSet<String>)
-where
-    F: Fn(&str, &HashSet<String>) -> bool,
-{
+    for_configuration: bool,
+) -> (Vec<v1beta1::Device>, HashSet<String>) {
     let mut devices: Vec<v1beta1::Device> = Vec::new();
     let mut current_usage_slots = configuration_usage_slots.clone();
     for (device_name, allocated_node) in device_usage {
@@ -1309,7 +1297,7 @@ where
             false
         } else {
             allocated_node.is_empty()
-                || reallocate_predicate(device_name, configuration_usage_slots)
+                || for_configuration == configuration_usage_slots.contains(device_name)
         };
 
         // Remove the device from the current usage slot if it is not reserved by any node
@@ -1944,16 +1932,6 @@ mod device_plugin_service_tests {
                 expected_devices_nodeb.insert(slot_name.clone(), HEALTHY.to_string());
             }
         }
-        // Allow to reallocate a virtual device from Instance, if it's not reserved by Configuration
-        let instance_reallocate_checker =
-            |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
-                !configuration_usage_slots.contains(device_usage_id)
-            };
-        // Allow to reallocate a virtual device from Configuration, if it's reserved by Configuration
-        let configuration_reallocate_checker =
-            |device_usage_id: &str, configuration_usage_slots: &HashSet<String>| {
-                configuration_usage_slots.contains(device_usage_id)
-            };
 
         // Test shared all healthy
         let slots_used_by_configuration = HashSet::new();
@@ -1962,7 +1940,7 @@ mod device_plugin_service_tests {
             true,
             "nodeA",
             &slots_used_by_configuration,
-            instance_reallocate_checker,
+            false,
         );
         for device in devices {
             assert_eq!(
@@ -1979,7 +1957,7 @@ mod device_plugin_service_tests {
             false,
             "nodeA",
             &slots_used_by_configuration,
-            instance_reallocate_checker,
+            false,
         );
         for device in devices {
             assert_eq!(
@@ -1996,7 +1974,7 @@ mod device_plugin_service_tests {
             true,
             "nodeB",
             &slots_used_by_configuration,
-            instance_reallocate_checker,
+            false,
         );
         for device in devices {
             assert_eq!(
@@ -2013,7 +1991,7 @@ mod device_plugin_service_tests {
             true,
             "nodeA",
             &slots_used_by_configuration,
-            instance_reallocate_checker,
+            false,
         );
         for device in devices {
             assert_eq!(
@@ -2030,7 +2008,7 @@ mod device_plugin_service_tests {
             false,
             "nodeA",
             &slots_used_by_configuration,
-            instance_reallocate_checker,
+            false,
         );
         for device in devices {
             assert_eq!(
@@ -2042,13 +2020,7 @@ mod device_plugin_service_tests {
 
         // Test unshared panic. A different node should never be listed under any device usage slots
         let result = std::panic::catch_unwind(|| {
-            build_virtual_devices(
-                &device_usage,
-                false,
-                "nodeB",
-                &HashSet::new(),
-                instance_reallocate_checker,
-            )
+            build_virtual_devices(&device_usage, false, "nodeB", &HashSet::new(), false)
         });
         assert!(result.is_err());
 
@@ -2059,7 +2031,7 @@ mod device_plugin_service_tests {
             true,
             "nodeA",
             &slots_used_by_configuration,
-            configuration_reallocate_checker,
+            true,
         );
         for device in devices {
             assert_eq!(
@@ -2076,7 +2048,7 @@ mod device_plugin_service_tests {
             false,
             "nodeA",
             &slots_used_by_configuration,
-            configuration_reallocate_checker,
+            true,
         );
         for device in devices {
             assert_eq!(
@@ -2093,7 +2065,7 @@ mod device_plugin_service_tests {
             true,
             "nodeA",
             &slots_used_by_configuration,
-            configuration_reallocate_checker,
+            true,
         );
         // when a virtual device is taken by instance device plugin
         // the health state of configuration virtual device is the same as taken by another node,
@@ -2112,7 +2084,7 @@ mod device_plugin_service_tests {
             false,
             "nodeA",
             &slots_used_by_configuration,
-            configuration_reallocate_checker,
+            true,
         );
         // When a virtual device is taken by instance device plugin
         // the health state of configuration virtual device is the same as taken by another node,
@@ -2132,7 +2104,7 @@ mod device_plugin_service_tests {
             true,
             "nodeA",
             &slots_used_by_configuration,
-            configuration_reallocate_checker,
+            true,
         );
         for device in devices {
             assert_eq!(
@@ -2159,10 +2131,7 @@ mod device_plugin_service_tests {
             &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
-            |device_usage_id, configuration_usage_slots| {
-                // device is healthy if not reserved by Configuration
-                !configuration_usage_slots.contains(device_usage_id)
-            },
+            false,
         )
         .await;
         devices
@@ -2194,10 +2163,7 @@ mod device_plugin_service_tests {
             &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
-            |device_usage_id, configuration_usage_slots| {
-                // Device is healthy if not reserved by Configuration
-                !configuration_usage_slots.contains(device_usage_id)
-            },
+            false,
         )
         .await;
         devices
@@ -2231,10 +2197,7 @@ mod device_plugin_service_tests {
             &instance_name,
             Arc::new(device_plugin_service),
             Arc::new(mock),
-            |device_usage_id, configuration_usage_slots| {
-                // Device is healthy if not reserved by Configuration
-                !configuration_usage_slots.contains(device_usage_id)
-            },
+            false,
         )
         .await;
         check_devices(instance_name, devices);
