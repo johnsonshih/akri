@@ -402,38 +402,13 @@ impl InstanceDevicePlugin {
                     device_usage_id
                 );
 
-                // If the slot already reserved by this node,
-                // only allow reallocate if the slot is not reserved by Configuration
-                let allow_reallocate = match dps
-                    .instance_map
-                    .read()
-                    .await
-                    .instances
-                    .get(&dps.instance_name)
-                    .ok_or_else(|| {
-                        Status::new(
-                            Code::Unknown,
-                            format!("instance {} not found in instance map", dps.instance_name),
-                        )
-                    }) {
-                    Ok(instance_info) => !instance_info
-                        .configuration_usage_slots
-                        .contains(&device_usage_id),
-
-                    Err(e) => {
-                        dps.list_and_watch_message_sender
-                            .send(ListAndWatchMessageKind::Continue)
-                            .unwrap();
-                        return Err(e);
-                    }
-                };
-
                 if let Err(e) = try_update_instance_device_usage(
                     &device_usage_id,
                     &dps.node_name,
                     &dps.instance_name,
                     &dps.config_namespace,
-                    allow_reallocate,
+                    dps.instance_map.clone(),
+                    false,
                     kube_interface.clone(),
                 )
                 .await
@@ -667,7 +642,7 @@ impl ConfigurationDevicePlugin {
                     }
                 };
                 // Find device from instance_map
-                let (device, instance_id, configuration_usage_slots) = match dps
+                let (device, instance_id) = match dps
                     .instance_map
                     .read()
                     .await
@@ -682,7 +657,6 @@ impl ConfigurationDevicePlugin {
                     Ok(instance_info) => (
                         instance_info.device.clone(),
                         instance_info.instance_id.clone(),
-                        instance_info.configuration_usage_slots.clone(),
                     ),
                     Err(e) => {
                         dps.list_and_watch_message_sender
@@ -692,15 +666,13 @@ impl ConfigurationDevicePlugin {
                     }
                 };
 
-                // Only allow duplicate reserve if the slot is reserved by Configuration
-                let allow_dup_reserve = configuration_usage_slots.contains(&device_usage_id);
-
                 if let Err(e) = try_update_instance_device_usage(
                     &device_usage_id,
                     &dps.node_name,
                     &instance_name,
                     &dps.config_namespace,
-                    allow_dup_reserve,
+                    dps.instance_map.clone(),
+                    true,
                     kube_interface.clone(),
                 )
                 .await
@@ -957,7 +929,8 @@ async fn try_update_instance_device_usage(
     node_name: &str,
     instance_name: &str,
     instance_namespace: &str,
-    allow_duplicate_reserve: bool,
+    instance_map: InstanceMap,
+    for_configuration: bool,
     kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(), Status> {
     let mut instance: InstanceSpec;
@@ -1004,7 +977,27 @@ async fn try_update_instance_device_usage(
                 "device usage id {} already reserved on node {}",
                 device_usage_id, node_name
             );
-            if allow_duplicate_reserve {
+            let instance_map_guard = instance_map.read().await;
+            if !instance_map_guard.instances.contains_key(instance_name) {
+                trace!(
+                    "try_update_instance_device_usage - Instance {} not found in instance map",
+                    instance_name
+                );
+                return Err(Status::new(
+                    Code::Unknown,
+                    format!(
+                        "Could not find Instance {} from instance map",
+                        instance_name
+                    ),
+                ));
+            }
+            let allocated_by_configuration = instance_map_guard
+                .instances
+                .get(instance_name)
+                .unwrap()
+                .configuration_usage_slots
+                .contains(device_usage_id);
+            if for_configuration == allocated_by_configuration {
                 return Ok(());
             }
             return Err(Status::new(Code::Unknown, "slot already reserved"));
