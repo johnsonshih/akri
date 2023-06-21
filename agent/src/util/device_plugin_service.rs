@@ -2045,7 +2045,8 @@ mod device_plugin_service_tests {
         let mut device_usage_all_free: HashMap<String, String> = HashMap::new();
         let mut expected_devices_nodea: HashMap<String, String> = HashMap::new();
         let mut expected_devices_nodeb: HashMap<String, String> = HashMap::new();
-        let mut allocated_usage_slots: HashMap<String, SlotAllocationStatus> = HashMap::new();
+        let mut configuration_allocated_usage_slots = HashMap::new();
+        let mut instance_allocated_usage_slots = HashMap::new();
         let instance_name = "s0meH@sH";
         for x in 0..5 {
             let slot_name = format!("{}-{}", instance_name, x);
@@ -2054,10 +2055,12 @@ mod device_plugin_service_tests {
                 device_usage.insert(slot_name.clone(), "nodeA".to_string());
                 expected_devices_nodea.insert(slot_name.clone(), HEALTHY.to_string());
                 expected_devices_nodeb.insert(slot_name.clone(), UNHEALTHY.to_string());
-                allocated_usage_slots.insert(
+                configuration_allocated_usage_slots.insert(
                     slot_name.clone(),
                     SlotAllocationStatus::ConfigurationReserved,
                 );
+                instance_allocated_usage_slots
+                    .insert(slot_name.clone(), SlotAllocationStatus::InstanceReserved);
             } else {
                 device_usage.insert(slot_name.clone(), "".to_string());
                 expected_devices_nodea.insert(slot_name.clone(), HEALTHY.to_string());
@@ -2066,7 +2069,7 @@ mod device_plugin_service_tests {
         }
 
         // Test shared all healthy
-        let slots_used_by_configuration = HashMap::new();
+        let slots_used_by_configuration = instance_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -2082,7 +2085,7 @@ mod device_plugin_service_tests {
         }
 
         // Test unshared all healthy
-        let slots_used_by_configuration = HashMap::new();
+        let slots_used_by_configuration = instance_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             false,
@@ -2114,7 +2117,7 @@ mod device_plugin_service_tests {
         }
 
         // Test shared some unhealthy instance virtual devices (taken by configuration device plugin)
-        let slots_used_by_configuration = allocated_usage_slots.clone();
+        let slots_used_by_configuration = configuration_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -2130,7 +2133,7 @@ mod device_plugin_service_tests {
         }
 
         // Test unshared some unhealthy instance virtual devices (taken by configuration device plugin)
-        let slots_used_by_configuration = allocated_usage_slots.clone();
+        let slots_used_by_configuration = configuration_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             false,
@@ -2152,7 +2155,7 @@ mod device_plugin_service_tests {
         assert!(result.is_err());
 
         // Test shared all healthy, Configuration virtual devices
-        let slots_used_by_configuration = allocated_usage_slots.clone();
+        let slots_used_by_configuration = configuration_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -2168,7 +2171,7 @@ mod device_plugin_service_tests {
         }
 
         // Test unshared all healthy, Configuration virtual devices
-        let slots_used_by_configuration = allocated_usage_slots.clone();
+        let slots_used_by_configuration = configuration_allocated_usage_slots.clone();
         let devices = build_virtual_devices(
             &device_usage,
             false,
@@ -2439,6 +2442,29 @@ mod device_plugin_service_tests {
                 InstanceConnectivityStatus::Online,
                 true,
             );
+        let instance_name = device_plugin_service
+            .instance_map
+            .read()
+            .await
+            .instances
+            .keys()
+            .next()
+            .unwrap()
+            .to_string();
+        let expected_usage_slots: HashMap<String, SlotAllocationStatus> =
+            vec![format!("{}-0", instance_name)]
+                .into_iter()
+                .map(|slot| (slot, SlotAllocationStatus::InstanceReserved))
+                .collect();
+        device_plugin_service
+            .instance_map
+            .write()
+            .await
+            .instances
+            .entry(instance_name.to_string())
+            .and_modify(|instance_info| {
+                instance_info.configuration_usage_slots = expected_usage_slots;
+            });
         let mut mock = MockKubeInterface::new();
         let request = setup_internal_allocate_tests(
             &mut mock,
