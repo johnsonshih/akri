@@ -925,8 +925,9 @@ async fn try_set_allocation_state(
             "device usage {} allocation_state {:?}",
             device_usage_id, allocation_state
         );
-        if (for_configuration && *allocation_state == SlotAllocationStatus::ConfigurationReserving)
-            || (!for_configuration && *allocation_state == SlotAllocationStatus::InstanceReserving)
+        if (for_configuration && *allocation_state == SlotAllocationStatus::InstanceReserving)
+            || (!for_configuration
+                && *allocation_state == SlotAllocationStatus::ConfigurationReserving)
         {
             // slot tagged for reserving, bail out
             info!(
