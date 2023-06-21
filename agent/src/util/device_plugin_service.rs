@@ -78,9 +78,9 @@ pub struct InstanceInfo {
     /// Contains information about environment variables and volumes that should be mounted
     /// into requesting Pods.
     pub device: Device,
-    /// Device usage slots allocated by Configuration Device Plugin
+    /// Device usage slots allocated by Device Plugins and allocation states
     /// Used to check if a device usage slot is allocated by Configuration or Instance Device Plugin
-    pub configuration_usage_slots: HashMap<String, SlotAllocationStatus>,
+    pub allocated_usage_slots: HashMap<String, SlotAllocationStatus>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -826,7 +826,7 @@ async fn get_instance_allocation_info(
                 };
                 return *status == SlotAllocationStatus::ConfigurationReserved;
             }
-            let status = match instance_info.configuration_usage_slots.get(id) {
+            let status = match instance_info.allocated_usage_slots.get(id) {
                 Some(v) => v,
                 None => &SlotAllocationStatus::Free,
             };
@@ -918,7 +918,7 @@ async fn try_set_allocation_state(
         .instances
         .get(instance_name)
         .unwrap()
-        .configuration_usage_slots
+        .allocated_usage_slots
         .get(device_usage_id)
     {
         info!(
@@ -948,7 +948,7 @@ async fn try_set_allocation_state(
         .entry(instance_name.to_string())
         .and_modify(|instance_info| {
             instance_info
-                .configuration_usage_slots
+                .allocated_usage_slots
                 .insert(device_usage_id.to_string(), allocation_state_to_set);
         });
     Ok((false, prev_allocation_state))
@@ -1057,12 +1057,10 @@ async fn try_update_instance_device_usage(
                     .entry(instance_name.to_string())
                     .and_modify(|instance_info| {
                         if prev_allocation_state == SlotAllocationStatus::Free {
-                            instance_info
-                                .configuration_usage_slots
-                                .remove(device_usage_id);
+                            instance_info.allocated_usage_slots.remove(device_usage_id);
                         } else {
                             instance_info
-                                .configuration_usage_slots
+                                .allocated_usage_slots
                                 .insert(device_usage_id.to_string(), prev_allocation_state);
                         }
                     });
@@ -1103,7 +1101,7 @@ async fn try_update_instance_device_usage(
                     .entry(instance_name.to_string())
                     .and_modify(|instance_info| {
                         instance_info
-                            .configuration_usage_slots
+                            .allocated_usage_slots
                             .insert(device_usage_id.to_string(), allocation_status);
                     });
                 return Ok(());
@@ -1132,7 +1130,7 @@ async fn try_update_instance_device_usage(
                 .instances
                 .get(instance_name)
                 .unwrap()
-                .configuration_usage_slots
+                .allocated_usage_slots
                 .get(device_usage_id)
             {
                 Some(v) => v,
@@ -1311,7 +1309,7 @@ async fn try_create_instance(
             connectivity_status: InstanceConnectivityStatus::Online,
             instance_id: instance_dp.instance_id.clone(),
             device: instance_dp.device.clone(),
-            configuration_usage_slots: HashMap::new(),
+            allocated_usage_slots: HashMap::new(),
         },
     );
 
@@ -1373,7 +1371,7 @@ async fn build_list_and_watch_response(
                 &kube_akri_instance.spec.device_usage,
                 kube_akri_instance.spec.shared,
                 &dps.node_name,
-                &instance_info.configuration_usage_slots,
+                &instance_info.allocated_usage_slots,
                 for_configuration,
             )
         }
@@ -1601,7 +1599,7 @@ mod device_plugin_service_tests {
                 connectivity_status,
                 instance_id: instance_id.to_string(),
                 device: device.clone(),
-                configuration_usage_slots: HashMap::new(),
+                allocated_usage_slots: HashMap::new(),
             };
             instances.insert(device_instance_name.clone(), instance_info);
         }
@@ -2469,7 +2467,7 @@ mod device_plugin_service_tests {
             .instances
             .entry(instance_name.to_string())
             .and_modify(|instance_info| {
-                instance_info.configuration_usage_slots = expected_usage_slots;
+                instance_info.allocated_usage_slots = expected_usage_slots;
             });
         let mut mock = MockKubeInterface::new();
         let request = setup_internal_allocate_tests(
@@ -2772,7 +2770,7 @@ mod device_plugin_service_tests {
                 .instances
                 .get(&instance_name)
                 .unwrap()
-                .configuration_usage_slots
+                .allocated_usage_slots
         );
     }
 
@@ -2832,7 +2830,7 @@ mod device_plugin_service_tests {
                 .instances
                 .get(&instance_name)
                 .unwrap()
-                .configuration_usage_slots
+                .allocated_usage_slots
         );
     }
 
@@ -2867,7 +2865,7 @@ mod device_plugin_service_tests {
             .instances
             .entry(instance_name.to_string())
             .and_modify(|instance_info| {
-                instance_info.configuration_usage_slots = expected_usage_slots;
+                instance_info.allocated_usage_slots = expected_usage_slots;
             });
         let mut mock = MockKubeInterface::new();
         let request = setup_configuration_internal_allocate_tests(
