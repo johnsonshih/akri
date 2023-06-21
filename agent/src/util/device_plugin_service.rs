@@ -23,11 +23,7 @@ use log::{error, info, trace};
 use mock_instant::Instant;
 #[cfg(not(test))]
 use std::time::Instant;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc, RwLock},
     time::timeout,
@@ -54,6 +50,21 @@ pub enum InstanceConnectivityStatus {
     Offline(Instant),
 }
 
+/// Describes the allocation status of a usage slot.
+#[derive(PartialEq, Debug, Clone)]
+pub enum SlotAllocationStatus {
+    /// Slot is free
+    Free,
+    /// Tagged for reserving by Instance Device Plugin
+    InstanceReserving,
+    /// Reserved by Instance Device Plugin
+    InstanceReserved,
+    /// Tagged for reserving by Configuration Device Plugin
+    ConfigurationReserving,
+    /// Reserved by Configuration Device Plugin
+    ConfigurationReserved,
+}
+
 /// Contains an Instance's state
 #[derive(Clone, Debug)]
 pub struct InstanceInfo {
@@ -69,7 +80,7 @@ pub struct InstanceInfo {
     pub device: Device,
     /// Device usage slots allocated by Configuration Device Plugin
     /// Used to check if a device usage slot is allocated by Configuration or Instance Device Plugin
-    pub configuration_usage_slots: HashSet<String>,
+    pub configuration_usage_slots: HashMap<String, SlotAllocationStatus>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -606,8 +617,8 @@ impl ConfigurationDevicePlugin {
         requests: Request<AllocateRequest>,
         kube_interface: Arc<impl KubeInterface>,
     ) -> Result<Response<AllocateResponse>, Status> {
-        let mut container_responses: Vec<v1beta1::ContainerAllocateResponse> = Vec::new();
-        let mut allocated_instances: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut container_responses = Vec::new();
+        let mut allocated_instances = HashMap::new();
         for request in requests.into_inner().container_requests {
             trace!(
                 "ConfigurationDevicePlugin::allocate - for Instance {} handling request {:?}",
@@ -706,8 +717,11 @@ impl ConfigurationDevicePlugin {
 
                 allocated_instances
                     .entry(instance_name.clone())
-                    .or_insert(HashSet::new())
-                    .insert(device_usage_id.clone());
+                    .or_insert(HashMap::new())
+                    .insert(
+                        device_usage_id.clone(),
+                        SlotAllocationStatus::ConfigurationReserved,
+                    );
 
                 trace!(
                     "ConfigurationDevicePlugin::allocate - finished processing device_usage_id {}",
@@ -728,25 +742,19 @@ impl ConfigurationDevicePlugin {
 
         // Notify effected instance device plugin to rescan list and watch and update the cl_usage_slot
         {
-            let mut instance_map = dps.instance_map.write().await;
-            for (instance_name, device_usage_slots) in allocated_instances {
+            let instance_map = dps.instance_map.read().await;
+            for instance_name in allocated_instances.keys() {
                 trace!(
                     "ConfigurationDevicePlugin::allocate - notify Instance {} to refresh list_and_watch",
                     instance_name,
                 );
 
-                instance_map
-                    .instances
-                    .entry(instance_name)
-                    .and_modify(|instance_info| {
-                        instance_info
-                            .configuration_usage_slots
-                            .extend(device_usage_slots);
-                        instance_info
-                            .list_and_watch_message_sender
-                            .send(ListAndWatchMessageKind::Continue)
-                            .unwrap();
-                    });
+                if let Some(instance_info) = instance_map.instances.get(instance_name) {
+                    instance_info
+                        .list_and_watch_message_sender
+                        .send(ListAndWatchMessageKind::Continue)
+                        .unwrap();
+                }
             }
         }
         trace!(
@@ -785,7 +793,7 @@ async fn get_instance_allocation_info(
     device_id: &str,
     config_namespace: &str,
     capacity: i32,
-    allocated_instances: &HashMap<String, HashSet<String>>,
+    allocated_instances: &HashMap<String, HashMap<String, SlotAllocationStatus>>,
     instance_map: InstanceMap,
     kube_interface: Arc<impl KubeInterface>,
 ) -> Result<(String, String), Status> {
@@ -812,11 +820,17 @@ async fn get_instance_allocation_info(
         .map(|x| format!("{}-{}", instance_name, x))
         .filter(|id| {
             if let Some(slots) = allocated_instances.get(instance_name) {
-                if slots.contains(id) {
-                    return true;
-                }
+                let status = match slots.get(id) {
+                    Some(v) => v,
+                    None => &SlotAllocationStatus::Free,
+                };
+                return *status == SlotAllocationStatus::ConfigurationReserved;
             }
-            instance_info.configuration_usage_slots.contains(id)
+            let status = match instance_info.configuration_usage_slots.get(id) {
+                Some(v) => v,
+                None => &SlotAllocationStatus::Free,
+            };
+            *status == SlotAllocationStatus::ConfigurationReserved
         })
         .collect::<Vec<_>>()
         .first()
@@ -969,37 +983,40 @@ async fn try_update_instance_device_usage(
                 }
                 random_delay().await;
             } else {
-                if !for_configuration {
-                    // slot reserved by Instance, remove the slot from configuration_usage_slots
-                    let mut instance_map_guard = instance_map.write().await;
-                    if !instance_map_guard.instances.contains_key(instance_name) {
-                        trace!(
-                            "try_update_instance_device_usage - Instance {} not found in instance map",
-                            instance_name
-                        );
-                        return Err(Status::new(
-                            Code::Unknown,
-                            format!(
-                                "Could not find Instance {} from instance map",
-                                instance_name
-                            ),
-                        ));
-                    }
+                // slot allocated update the slot allocation status
+                let mut instance_map_guard = instance_map.write().await;
+                if !instance_map_guard.instances.contains_key(instance_name) {
                     trace!(
-                        "Remove {} from configuration_usage_slots of Instance {}",
-                        device_usage_id,
+                        "try_update_instance_device_usage - Instance {} not found in instance map",
                         instance_name
                     );
-
-                    instance_map_guard
-                        .instances
-                        .entry(instance_name.to_string())
-                        .and_modify(|instance_info| {
-                            instance_info
-                                .configuration_usage_slots
-                                .remove(device_usage_id);
-                        });
+                    return Err(Status::new(
+                        Code::Unknown,
+                        format!(
+                            "Could not find Instance {} from instance map",
+                            instance_name
+                        ),
+                    ));
                 }
+                trace!(
+                    "Remove {} from configuration_usage_slots of Instance {}",
+                    device_usage_id,
+                    instance_name
+                );
+
+                let allocation_status = if for_configuration {
+                    SlotAllocationStatus::ConfigurationReserved
+                } else {
+                    SlotAllocationStatus::InstanceReserved
+                };
+                instance_map_guard
+                    .instances
+                    .entry(instance_name.to_string())
+                    .and_modify(|instance_info| {
+                        instance_info
+                            .configuration_usage_slots
+                            .insert(device_usage_id.to_string(), allocation_status);
+                    });
                 return Ok(());
             }
         } else {
@@ -1022,13 +1039,22 @@ async fn try_update_instance_device_usage(
                     ),
                 ));
             }
-            let allocated_by_configuration = instance_map_guard
+            let allocation_status = match instance_map_guard
                 .instances
                 .get(instance_name)
                 .unwrap()
                 .configuration_usage_slots
-                .contains(device_usage_id);
-            if for_configuration == allocated_by_configuration {
+                .get(device_usage_id)
+            {
+                Some(v) => v,
+                None => &SlotAllocationStatus::Free,
+            };
+            if for_configuration
+                && *allocation_status == SlotAllocationStatus::ConfigurationReserved
+            {
+                return Ok(());
+            }
+            if !for_configuration && *allocation_status == SlotAllocationStatus::InstanceReserved {
                 return Ok(());
             }
             return Err(Status::new(Code::Unknown, "slot already reserved"));
@@ -1196,7 +1222,7 @@ async fn try_create_instance(
             connectivity_status: InstanceConnectivityStatus::Online,
             instance_id: instance_dp.instance_id.clone(),
             device: instance_dp.device.clone(),
-            configuration_usage_slots: HashSet::new(),
+            configuration_usage_slots: HashMap::new(),
         },
     );
 
@@ -1294,7 +1320,7 @@ fn build_virtual_devices(
     device_usage: &HashMap<String, String>,
     shared: bool,
     node_name: &str,
-    configuration_usage_slots: &HashSet<String>,
+    configuration_usage_slots: &HashMap<String, SlotAllocationStatus>,
     for_configuration: bool,
 ) -> Vec<v1beta1::Device> {
     let mut devices: Vec<v1beta1::Device> = Vec::new();
@@ -1306,8 +1332,16 @@ fn build_virtual_devices(
             }
             false
         } else {
+            let allocation_status = match configuration_usage_slots.get(device_name) {
+                Some(v) => v,
+                None => &SlotAllocationStatus::Free,
+            };
+
             allocated_node.is_empty()
-                || for_configuration == configuration_usage_slots.contains(device_name)
+                || (for_configuration
+                    && *allocation_status == SlotAllocationStatus::ConfigurationReserved)
+                || (!for_configuration
+                    && *allocation_status == SlotAllocationStatus::InstanceReserved)
         };
 
         let health = if healthy { HEALTHY } else { UNHEALTHY };
@@ -1472,7 +1506,7 @@ mod device_plugin_service_tests {
                 connectivity_status,
                 instance_id: instance_id.to_string(),
                 device: device.clone(),
-                configuration_usage_slots: HashSet::new(),
+                configuration_usage_slots: HashMap::new(),
             };
             instances.insert(device_instance_name.clone(), instance_info);
         }
@@ -1922,7 +1956,7 @@ mod device_plugin_service_tests {
         let mut device_usage_all_free: HashMap<String, String> = HashMap::new();
         let mut expected_devices_nodea: HashMap<String, String> = HashMap::new();
         let mut expected_devices_nodeb: HashMap<String, String> = HashMap::new();
-        let mut allocated_usage_slots: HashSet<String> = HashSet::new();
+        let mut allocated_usage_slots: HashMap<String, SlotAllocationStatus> = HashMap::new();
         let instance_name = "s0meH@sH";
         for x in 0..5 {
             let slot_name = format!("{}-{}", instance_name, x);
@@ -1931,7 +1965,10 @@ mod device_plugin_service_tests {
                 device_usage.insert(slot_name.clone(), "nodeA".to_string());
                 expected_devices_nodea.insert(slot_name.clone(), HEALTHY.to_string());
                 expected_devices_nodeb.insert(slot_name.clone(), UNHEALTHY.to_string());
-                allocated_usage_slots.insert(slot_name.clone());
+                allocated_usage_slots.insert(
+                    slot_name.clone(),
+                    SlotAllocationStatus::ConfigurationReserved,
+                );
             } else {
                 device_usage.insert(slot_name.clone(), "".to_string());
                 expected_devices_nodea.insert(slot_name.clone(), HEALTHY.to_string());
@@ -1940,7 +1977,7 @@ mod device_plugin_service_tests {
         }
 
         // Test shared all healthy
-        let slots_used_by_configuration = HashSet::new();
+        let slots_used_by_configuration = HashMap::new();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -1956,7 +1993,7 @@ mod device_plugin_service_tests {
         }
 
         // Test unshared all healthy
-        let slots_used_by_configuration = HashSet::new();
+        let slots_used_by_configuration = HashMap::new();
         let devices = build_virtual_devices(
             &device_usage,
             false,
@@ -1972,7 +2009,7 @@ mod device_plugin_service_tests {
         }
 
         // Test shared some unhealthy (taken by another node)
-        let slots_used_by_configuration = HashSet::new();
+        let slots_used_by_configuration = HashMap::new();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -2021,7 +2058,7 @@ mod device_plugin_service_tests {
 
         // Test unshared panic. A different node should never be listed under any device usage slots
         let result = std::panic::catch_unwind(|| {
-            build_virtual_devices(&device_usage, false, "nodeB", &HashSet::new(), false)
+            build_virtual_devices(&device_usage, false, "nodeB", &HashMap::new(), false)
         });
         assert!(result.is_err());
 
@@ -2058,7 +2095,7 @@ mod device_plugin_service_tests {
         }
 
         // Test shared some unhealthy configuration virtual devices (taken by instance device plugin)
-        let slots_used_by_configuration = HashSet::new();
+        let slots_used_by_configuration = HashMap::new();
         let devices = build_virtual_devices(
             &device_usage,
             true,
@@ -2076,7 +2113,7 @@ mod device_plugin_service_tests {
         }
 
         // Test unshared some unhealthy configuration virtual devices (taken by instance device plugin)
-        let slots_used_by_configuration = HashSet::new();
+        let slots_used_by_configuration = HashMap::new();
         let devices = build_virtual_devices(
             &device_usage,
             false,
@@ -2600,8 +2637,11 @@ mod device_plugin_service_tests {
                 .unwrap(),
             ListAndWatchMessageKind::Continue
         );
-        let expected_usage_slots: HashSet<String> =
-            vec![format!("{}-0", instance_name)].into_iter().collect();
+        let expected_usage_slots: HashMap<String, SlotAllocationStatus> =
+            vec![format!("{}-0", instance_name)]
+                .into_iter()
+                .map(|slot| (slot, SlotAllocationStatus::ConfigurationReserved))
+                .collect();
         assert_eq!(
             expected_usage_slots,
             device_plugin_service
@@ -2657,8 +2697,11 @@ mod device_plugin_service_tests {
                 .unwrap(),
             ListAndWatchMessageKind::Continue
         );
-        let expected_usage_slots: HashSet<String> =
-            vec![format!("{}-0", instance_name)].into_iter().collect();
+        let expected_usage_slots: HashMap<String, SlotAllocationStatus> =
+            vec![format!("{}-0", instance_name)]
+                .into_iter()
+                .map(|slot| (slot, SlotAllocationStatus::ConfigurationReserved))
+                .collect();
         assert_eq!(
             expected_usage_slots,
             device_plugin_service
@@ -2691,8 +2734,11 @@ mod device_plugin_service_tests {
             .next()
             .unwrap()
             .to_string();
-        let expected_usage_slots: HashSet<String> =
-            vec![format!("{}-0", instance_name)].into_iter().collect();
+        let expected_usage_slots: HashMap<String, SlotAllocationStatus> =
+            vec![format!("{}-0", instance_name)]
+                .into_iter()
+                .map(|slot| (slot, SlotAllocationStatus::ConfigurationReserved))
+                .collect();
         device_plugin_service
             .instance_map
             .write()

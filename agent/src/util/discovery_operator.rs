@@ -806,7 +806,6 @@ pub mod tests {
     };
     use mock_instant::{Instant, MockClock};
     use mockall::Sequence;
-    use std::collections::HashSet;
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
 
@@ -864,7 +863,7 @@ pub mod tests {
                             connectivity_status: connectivity_status.clone(),
                             instance_id: device.id.clone(),
                             device: device.clone(),
-                            configuration_usage_slots: HashSet::<String>::new(),
+                            configuration_usage_slots: HashMap::new(),
                         },
                     )
                 })
