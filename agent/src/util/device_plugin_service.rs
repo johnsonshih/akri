@@ -893,6 +893,67 @@ async fn find_free_instance_device_usage_slot(
     Ok(None)
 }
 
+async fn try_set_allocation_state(
+    device_usage_id: &str,
+    instance_name: &str,
+    instance_map: InstanceMap,
+    for_configuration: bool,
+) -> Result<(bool, SlotAllocationStatus), Status> {
+    let mut instance_map_guard = instance_map.write().await;
+    if !instance_map_guard.instances.contains_key(instance_name) {
+        trace!(
+            "try_update_instance_device_usage - Instance {} not found in instance map",
+            instance_name
+        );
+        return Err(Status::new(
+            Code::Unknown,
+            format!(
+                "Could not find Instance {} from instance map",
+                instance_name
+            ),
+        ));
+    }
+    let mut prev_allocation_state = SlotAllocationStatus::Free;
+    if let Some(allocation_state) = instance_map_guard
+        .instances
+        .get(instance_name)
+        .unwrap()
+        .configuration_usage_slots
+        .get(device_usage_id)
+    {
+        info!(
+            "device usage {} allocation_state {:?}",
+            device_usage_id, allocation_state
+        );
+        if (for_configuration && *allocation_state == SlotAllocationStatus::ConfigurationReserving)
+            || (!for_configuration && *allocation_state == SlotAllocationStatus::InstanceReserving)
+        {
+            // slot tagged for reserving, bail out
+            info!(
+                "slot {} tagged for reserving {:?}, bail out",
+                device_usage_id, allocation_state
+            );
+            return Ok((true, allocation_state.clone()));
+        }
+        prev_allocation_state = allocation_state.clone();
+    }
+
+    let allocation_state_to_set = if for_configuration {
+        SlotAllocationStatus::ConfigurationReserving
+    } else {
+        SlotAllocationStatus::InstanceReserving
+    };
+    instance_map_guard
+        .instances
+        .entry(instance_name.to_string())
+        .and_modify(|instance_info| {
+            instance_info
+                .configuration_usage_slots
+                .insert(device_usage_id.to_string(), allocation_state_to_set);
+        });
+    Ok((false, prev_allocation_state))
+}
+
 /// This returns true if this node can reserve a `device_usage_id` slot for an instance
 /// and false if it is already reserved.
 /// # More details
@@ -969,14 +1030,43 @@ async fn try_update_instance_device_usage(
 
         // Update the instance to reserve this slot for this node iff it is available and not already reserved for this node.
         if slot_available_to_reserve(device_usage_id, node_name, &instance)? {
-            instance
-                .device_usage
-                .insert(device_usage_id.to_string(), node_name.to_string());
+            let (conflict, prev_allocation_state) = try_set_allocation_state(
+                device_usage_id,
+                instance_name,
+                instance_map.clone(),
+                for_configuration,
+            )
+            .await?;
 
-            if let Err(e) = kube_interface
-                .update_instance(&instance, instance_name, instance_namespace)
-                .await
-            {
+            let result = if !conflict {
+                instance
+                    .device_usage
+                    .insert(device_usage_id.to_string(), node_name.to_string());
+
+                kube_interface
+                    .update_instance(&instance, instance_name, instance_namespace)
+                    .await
+            } else {
+                Err(Status::new(Code::Unknown, "usage id tagged as allocating").into())
+            };
+            if let Err(e) = result {
+                // restore tagging
+                let mut instance_map_guard = instance_map.write().await;
+                instance_map_guard
+                    .instances
+                    .entry(instance_name.to_string())
+                    .and_modify(|instance_info| {
+                        if prev_allocation_state == SlotAllocationStatus::Free {
+                            instance_info
+                                .configuration_usage_slots
+                                .remove(device_usage_id);
+                        } else {
+                            instance_info
+                                .configuration_usage_slots
+                                .insert(device_usage_id.to_string(), prev_allocation_state);
+                        }
+                    });
+
                 if x == (MAX_INSTANCE_UPDATE_TRIES - 1) {
                     trace!("try_update_instance_device_usage - update_instance returned error [{}] after max tries ... returning error", e);
                     return Err(Status::new(Code::Unknown, "Could not update Instance"));
@@ -998,17 +1088,16 @@ async fn try_update_instance_device_usage(
                         ),
                     ));
                 }
-                trace!(
-                    "Remove {} from configuration_usage_slots of Instance {}",
-                    device_usage_id,
-                    instance_name
-                );
 
                 let allocation_status = if for_configuration {
                     SlotAllocationStatus::ConfigurationReserved
                 } else {
                     SlotAllocationStatus::InstanceReserved
                 };
+                info!(
+                    "Update {} of Instance {} allocation status to {:?}",
+                    device_usage_id, instance_name, allocation_status,
+                );
                 instance_map_guard
                     .instances
                     .entry(instance_name.to_string())
