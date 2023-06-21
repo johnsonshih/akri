@@ -1426,11 +1426,17 @@ fn build_virtual_devices(
                 None => &SlotAllocationStatus::Free,
             };
 
+            let (configuration_allocated, instance_allocated) = match allocation_status {
+                SlotAllocationStatus::ConfigurationReserving
+                | SlotAllocationStatus::ConfigurationReserved => (true, false),
+                SlotAllocationStatus::InstanceReserving
+                | SlotAllocationStatus::InstanceReserved => (false, true),
+                _ => (false, false),
+            };
+
             allocated_node.is_empty()
-                || (for_configuration
-                    && *allocation_status == SlotAllocationStatus::ConfigurationReserved)
-                || (!for_configuration
-                    && *allocation_status == SlotAllocationStatus::InstanceReserved)
+                || (for_configuration && configuration_allocated)
+                || (!for_configuration && instance_allocated)
         };
 
         let health = if healthy { HEALTHY } else { UNHEALTHY };
