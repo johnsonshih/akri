@@ -785,7 +785,7 @@ fn build_virtual_device_health_state_for_instance(
         .collect::<HashMap<String, String>>()
 }
 
-// for per-instance virtual device, the device id is the instance name
+// For per-instance virtual device, the device id is the instance name
 // to get the device usage id for allocation first check if already allocated, if yes, return error
 // if not allocated yet, check if any usage slot is free and use it
 // if no free slots, return error
@@ -893,7 +893,7 @@ async fn find_free_instance_device_usage_slot(
     Ok(None)
 }
 
-async fn try_set_allocation_state(
+async fn try_reserving_usage_slot(
     device_usage_id: &str,
     instance_name: &str,
     instance_map: InstanceMap,
@@ -921,15 +921,16 @@ async fn try_set_allocation_state(
         .allocated_usage_slots
         .get(device_usage_id)
     {
-        info!(
+        trace!(
             "device usage {} allocation_state {:?}",
-            device_usage_id, allocation_state
+            device_usage_id,
+            allocation_state
         );
         if (for_configuration && *allocation_state == SlotAllocationStatus::InstanceReserving)
             || (!for_configuration
                 && *allocation_state == SlotAllocationStatus::ConfigurationReserving)
         {
-            // slot tagged for reserving, bail out
+            // Conflict, slot tagged for reserving by a different device plugin
             info!(
                 "slot {} tagged for reserving {:?}, bail out",
                 device_usage_id, allocation_state
@@ -1031,7 +1032,7 @@ async fn try_update_instance_device_usage(
 
         // Update the instance to reserve this slot for this node iff it is available and not already reserved for this node.
         if slot_available_to_reserve(device_usage_id, node_name, &instance)? {
-            let (conflict, prev_allocation_state) = try_set_allocation_state(
+            let (conflict, prev_allocation_state) = try_reserving_usage_slot(
                 device_usage_id,
                 instance_name,
                 instance_map.clone(),
@@ -1051,7 +1052,7 @@ async fn try_update_instance_device_usage(
                 Err(Status::new(Code::Unknown, "usage id tagged as allocating").into())
             };
             if let Err(e) = result {
-                // restore tagging
+                // Restore tagging
                 let mut instance_map_guard = instance_map.write().await;
                 instance_map_guard
                     .instances
@@ -1072,7 +1073,7 @@ async fn try_update_instance_device_usage(
                 }
                 random_delay().await;
             } else {
-                // slot allocated update the slot allocation status
+                // Slot allocated, update the slot allocation status
                 let mut instance_map_guard = instance_map.write().await;
                 if !instance_map_guard.instances.contains_key(instance_name) {
                     trace!(
@@ -1362,7 +1363,7 @@ async fn build_list_and_watch_response(
     {
         Ok(kube_akri_instance) => {
             let instance_map = dps.instance_map.read().await;
-            // recheck if the instance still exists
+            // Recheck if the instance still exists
             if !instance_map.instances.contains_key(instance_name) {
                 trace!("build_list_and_watch_response - Instance {} removed from map ... returning unhealthy devices", instance_name);
                 return build_unhealthy_virtual_devices(dps.config.capacity, instance_name);
@@ -2200,7 +2201,7 @@ mod device_plugin_service_tests {
             &slots_used_by_configuration,
             true,
         );
-        // when a virtual device is taken by instance device plugin
+        // When a virtual device is taken by instance device plugin
         // the health state of configuration virtual device is the same as taken by another node,
         for device in devices {
             assert_eq!(
