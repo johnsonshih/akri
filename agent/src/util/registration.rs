@@ -5,7 +5,7 @@ use super::constants::ENABLE_DEBUG_ECHO_LABEL;
 use akri_discovery_utils::discovery::v0::{
     register_discovery_handler_request::EndpointType,
     registration_server::{Registration, RegistrationServer},
-    Empty, RegisterDiscoveryHandlerRequest,
+    Empty, QueryDeviceInfoRequest, QueryDeviceInfoResponse, RegisterDiscoveryHandlerRequest,
 };
 #[cfg(any(test, feature = "agent-full"))]
 use akri_shared::os::env_var::{ActualEnvVarQuery, EnvVarQuery};
@@ -155,6 +155,36 @@ impl Registration for AgentRegistration {
         }
         Ok(Response::new(Empty {}))
     }
+
+    /// Implement rpc method:QueryDeviceInfo
+    /// Based on payload and query_device_http, http posts to external service
+    /// to fetch additional device information
+    async fn query_device_info(
+        &self,
+        request: Request<QueryDeviceInfoRequest>,
+    ) -> Result<Response<QueryDeviceInfoResponse>, Status> {
+        let req = request.into_inner();
+        let response = post_device_query(req.uri, req.payload)
+            .await
+            .map_err(|e| tonic::Status::new(tonic::Code::NotFound, format!("{}", e)))?;
+        Ok(Response::new(QueryDeviceInfoResponse {
+            query_device_result: response,
+        }))
+    }
+}
+
+async fn post_device_query(
+    uri: String,
+    payload: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = hyper::Client::new();
+    let req = hyper::Request::post(uri)
+        .header("Content-Type", "application/json")
+        .body(hyper::Body::from(payload.into_bytes()))?;
+    let res = client.request(req).await?;
+    let body_bytes = hyper::body::to_bytes(res).await?;
+    let response = String::from_utf8(body_bytes.to_vec())?;
+    Ok(response)
 }
 
 /// Serves the Agent registration service over UDS.

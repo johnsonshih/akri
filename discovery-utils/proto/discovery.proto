@@ -6,6 +6,8 @@ package v0;
 // Any `DiscoveryHandler` can register with the Akri Agent.
 service Registration {
     rpc RegisterDiscoveryHandler(RegisterDiscoveryHandlerRequest) returns (Empty) {}
+    // Accept device information query requests from clients
+    rpc QueryDeviceInfo(QueryDeviceInfoRequest) returns (QueryDeviceInfoResponse) {}
 }
 
 
@@ -27,6 +29,16 @@ message RegisterDiscoveryHandlerRequest {
 }
 
 message Empty {
+}
+
+message QueryDeviceInfoRequest {
+    // Device information in JSON string format, Agent directly send this to uri REST API
+    string payload = 1;
+    string uri = 2;
+}
+
+message QueryDeviceInfoResponse {
+    string query_device_result = 1;
 }
 
 service DiscoveryHandler {

@@ -30,6 +30,19 @@ pub mod register_discovery_handler_request {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Empty {}
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryDeviceInfoRequest {
+    /// Device information in JSON string format, Agent directly send this to uri REST API
+    #[prost(string, tag = "1")]
+    pub payload: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub uri: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryDeviceInfoResponse {
+    #[prost(string, tag = "1")]
+    pub query_device_result: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ByteData {
     #[prost(bytes = "vec", optional, tag = "1")]
     pub vec: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
@@ -178,6 +191,21 @@ pub mod registration_client {
                 http::uri::PathAndQuery::from_static("/v0.Registration/RegisterDiscoveryHandler");
             self.inner.unary(request.into_request(), path, codec).await
         }
+        #[doc = " Accept device information query requests from clients"]
+        pub async fn query_device_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::QueryDeviceInfoRequest>,
+        ) -> Result<tonic::Response<super::QueryDeviceInfoResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::new(
+                    tonic::Code::Unknown,
+                    format!("Service was not ready: {}", e.into()),
+                )
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/v0.Registration/QueryDeviceInfo");
+            self.inner.unary(request.into_request(), path, codec).await
+        }
     }
 }
 #[doc = r" Generated client implementations."]
@@ -270,6 +298,11 @@ pub mod registration_server {
             &self,
             request: tonic::Request<super::RegisterDiscoveryHandlerRequest>,
         ) -> Result<tonic::Response<super::Empty>, tonic::Status>;
+        #[doc = " Accept device information query requests from clients"]
+        async fn query_device_info(
+            &self,
+            request: tonic::Request<super::QueryDeviceInfoRequest>,
+        ) -> Result<tonic::Response<super::QueryDeviceInfoResponse>, tonic::Status>;
     }
     #[doc = " Registration is the service advertised by the Akri Agent."]
     #[doc = " Any `DiscoveryHandler` can register with the Akri Agent."]
@@ -337,6 +370,39 @@ pub mod registration_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = RegisterDiscoveryHandlerSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec).apply_compression_config(
+                            accept_compression_encodings,
+                            send_compression_encodings,
+                        );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/v0.Registration/QueryDeviceInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct QueryDeviceInfoSvc<T: Registration>(pub Arc<T>);
+                    impl<T: Registration> tonic::server::UnaryService<super::QueryDeviceInfoRequest>
+                        for QueryDeviceInfoSvc<T>
+                    {
+                        type Response = super::QueryDeviceInfoResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::QueryDeviceInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = self.0.clone();
+                            let fut = async move { (*inner).query_device_info(request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = QueryDeviceInfoSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec).apply_compression_config(
                             accept_compression_encodings,
