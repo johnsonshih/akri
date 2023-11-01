@@ -1,7 +1,9 @@
+use crate::discovery::v0::{QueryDeviceInfoRequest, QueryDeviceInfoResponse};
+
 use super::discovery::v0::{
     registration_client::RegistrationClient, RegisterDiscoveryHandlerRequest,
 };
-use log::{info, trace};
+use log::{error, info, trace};
 use std::convert::TryFrom;
 use tonic::{
     transport::{Endpoint, Uri},
@@ -48,6 +50,30 @@ pub async fn register_discovery_handler_again(
             None => {
                 info!("register_again - connection to register_again_sender closed ... error")
             }
+        }
+    }
+}
+
+pub async fn query_device_info(
+    query_request: &QueryDeviceInfoRequest,
+) -> Result<QueryDeviceInfoResponse, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    info!("query_device_info - entered");
+    // We will ignore this dummy uri because UDS does not use it.
+    // Some servers will check the uri content so the uri needs to
+    // be in valid format even it's not used, the scheme part is used
+    // to specific what scheme to use, such as http or https
+    let channel = Endpoint::try_from("http://[::1]:50051")?
+        .connect_with_connector(tower::service_fn(move |_: Uri| {
+            tokio::net::UnixStream::connect(super::get_registration_socket())
+        }))
+        .await?;
+    let mut client = RegistrationClient::new(channel);
+    let request = Request::new(query_request.clone());
+    match client.query_device_info(request).await {
+        Ok(r) => Ok(r.into_inner()),
+        Err(e) => {
+            error!("query_device_info error: {:?}", e);
+            Err(e.into())
         }
     }
 }
