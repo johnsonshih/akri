@@ -1,8 +1,12 @@
 use akri_discovery_utils::discovery::{
     discovery_handler::{deserialize_discovery_details, DISCOVERED_DEVICES_CHANNEL_CAPACITY},
-    v0::{discovery_handler_server::DiscoveryHandler, Device, DiscoverRequest, DiscoverResponse},
+    v0::{
+        discovery_handler_server::DiscoveryHandler, ByteData, Device, DiscoverRequest,
+        DiscoverResponse,
+    },
     DiscoverStream,
 };
+use akri_discovery_utils::registration_client::{query_devices, DeviceQueryInput};
 use async_trait::async_trait;
 use log::{error, info, trace};
 use std::time::Duration;
@@ -30,6 +34,12 @@ pub const OFFLINE: &str = "OFFLINE";
 #[serde(rename_all = "camelCase")]
 pub struct DebugEchoDiscoveryDetails {
     pub descriptions: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct QueryDevicePostBody {
+    pub id: String,
+    pub protocol: String,
 }
 
 /// The DiscoveryHandlerImpl discovers a list of devices, named in its `descriptions`.
@@ -60,6 +70,7 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
         let discovery_handler_config: DebugEchoDiscoveryDetails =
             deserialize_discovery_details(&discover_request.discovery_details)
                 .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, format!("{}", e)))?;
+        let query_device_url = get_query_device_url(&discover_request.discovery_properties);
         let descriptions = discovery_handler_config.descriptions;
         let mut offline = fs::read_to_string(DEBUG_ECHO_AVAILABILITY_CHECK_PATH)
             .unwrap_or_default()
@@ -121,6 +132,24 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
                             }
                         })
                         .collect::<Vec<Device>>();
+                    let device_queries = devices
+                        .iter()
+                        .map(|d| {
+                            let query_body = QueryDevicePostBody {
+                                id: d.id.clone(),
+                                protocol: crate::DISCOVERY_HANDLER_NAME.to_string(),
+                            };
+                            DeviceQueryInput {
+                                id: d.id.clone(),
+                                payload: Some(
+                                    serde_json::to_string(&query_body)
+                                        .unwrap_or(String::from("{}")),
+                                ),
+                                device: d.clone(),
+                            }
+                        })
+                        .collect::<Vec<DeviceQueryInput>>();
+                    let devices = query_devices(query_device_url.as_ref(), device_queries).await;
                     if let Err(e) = discovered_devices_sender
                         .send(Ok(DiscoverResponse { devices }))
                         .await
@@ -140,6 +169,21 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
             discovered_devices_receiver,
         )))
     }
+}
+
+fn get_query_device_url(discovery_properties: &HashMap<String, ByteData>) -> Option<String> {
+    pub const QUERY_DEVICE_URL_KEY_NAME: &str = "query_device_url";
+    discovery_properties
+        .get(QUERY_DEVICE_URL_KEY_NAME)
+        .and_then(byte_data_to_str)
+        .map(|url| url.to_string())
+}
+
+fn byte_data_to_str(byte_data: &ByteData) -> Option<&str> {
+    byte_data
+        .vec
+        .as_ref()
+        .and_then(|s| std::str::from_utf8(s).ok())
 }
 
 #[cfg(test)]

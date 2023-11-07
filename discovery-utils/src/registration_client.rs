@@ -1,9 +1,10 @@
 use crate::discovery::v0::{QueryDeviceInfoRequest, QueryDeviceInfoResponse};
 
 use super::discovery::v0::{
-    registration_client::RegistrationClient, RegisterDiscoveryHandlerRequest,
+    registration_client::RegistrationClient, Device, RegisterDiscoveryHandlerRequest,
 };
 use log::{error, info, trace};
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use tonic::{
     transport::{Endpoint, Uri},
@@ -75,5 +76,88 @@ pub async fn query_device_info(
             error!("query_device_info error: {:?}", e);
             Err(e.into())
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct DeviceQueryInput {
+    pub id: String,
+    pub payload: Option<String>,
+    pub device: Device,
+}
+
+#[derive(Serialize, Debug, Default, Deserialize)]
+struct QueryDeviceResponseBody {
+    pub result: String,
+    pub properties: HashMap<String, String>,
+}
+
+pub async fn query_devices(
+    query_device_url: Option<&String>,
+    queries: Vec<DeviceQueryInput>,
+) -> Vec<Device> {
+    if let Some(query_url) = query_device_url {
+        let mut fetch_devices_tasks = Vec::new();
+        for device_query in queries.clone() {
+            fetch_devices_tasks.push(tokio::spawn(query_device(query_url.clone(), device_query)));
+        }
+        let result = futures::future::try_join_all(fetch_devices_tasks).await;
+        if let Ok(query_devices_result) = result {
+            return query_devices_result
+                .into_iter()
+                .flatten()
+                .collect::<Vec<Device>>();
+        }
+    }
+
+    // If there is no need to query additional device information or
+    // the previous device query is not completely successful, simple
+    // assembl Devices and return
+    queries
+        .into_iter()
+        .map(|device_query| device_query.device)
+        .collect::<Vec<Device>>()
+}
+
+async fn query_device(query_uri: String, query_input: DeviceQueryInput) -> Option<Device> {
+    match query_input.payload {
+        Some(query_payload) => {
+            let request = QueryDeviceInfoRequest {
+                payload: query_payload.clone(),
+                uri: query_uri,
+            };
+            let result = query_device_info(&request).await;
+            match result {
+                Ok(query_device_response) => {
+                    info!(
+                        "Success to query {query_payload}: {:?}",
+                        query_device_response
+                    );
+
+                    let query_response = serde_json::from_str::<QueryDeviceResponseBody>(
+                        &query_device_response.query_device_result,
+                    )
+                    .unwrap_or_default();
+                    if query_response.result.to_lowercase() != "accept" {
+                        None
+                    } else {
+                        let mut updated_device = query_input.device.clone();
+                        updated_device.properties.extend(
+                            query_response
+                                .properties
+                                .iter()
+                                .map(|(k, v)| (k.to_uppercase(), v.to_string())),
+                        );
+                        Some(updated_device)
+                    }
+                }
+                Err(e) => {
+                    error!("Fail to query {query_payload}: {e}");
+                    // Drop the device if query fails
+                    None
+                }
+            }
+        }
+        None => Some(query_input.device.clone()),
     }
 }

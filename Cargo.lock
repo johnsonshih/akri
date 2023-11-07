@@ -387,6 +387,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_derive",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio 1.26.0",
